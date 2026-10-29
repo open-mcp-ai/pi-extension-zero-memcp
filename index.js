@@ -136,6 +136,16 @@ async function recall(cfg, text) {
   return Array.isArray(body.hits) ? body.hits : []
 }
 
+/** 取信箱未读状态。轻量 GET，毫秒级。 */
+async function fetchMailbox(cfg, profile = '') {
+  const url = profile
+    ? `${cfg.endpoint}/mailbox?profile=${encodeURIComponent(profile)}`
+    : `${cfg.endpoint}/mailbox`
+  const res = await fetch(url, { signal: AbortSignal.timeout(600) })
+  if (!res.ok) throw new Error(`mailbox ${res.status}`)
+  return await res.json()
+}
+
 /** 取服务端状态（含 docs_indexed 逻辑时钟） */
 async function fetchHealth(cfg, profile = '') {
   const url = profile
@@ -358,6 +368,9 @@ export default function zeroMemcp(pi) {
   // 连接状态。用来判断「恢复」这个事件：上一轮不可达、这一轮可达。
   // 单看「可达」没有意义，只有从 false 翻到 true 才是重连。
   let lastHealthy = null
+
+  // 信箱未读数。0 表示没有需要确认的东西，此时不注入任何提示。
+  let mailboxUnread = 0
 
   // 会话级的开关：子代理整个生命周期都不注入、不联想。
   let skip = false
@@ -654,10 +667,12 @@ export default function zeroMemcp(pi) {
         identityAgeMs: identityAt ? Date.now() - identityAt : null,
         identityError: identityError ? String(identityError) : null,
 
+        // ── 信箱 ──
+        mailboxUnread,                         // 未确认信件数（>0 时每轮持续提示）
+
         // ── 记忆版本号（逻辑时钟）──
         serverDocs,                            // 服务端此刻的读数
         seenDocs,                              // 我这轮看到的
-        clockJump: jumpNote || null,           // 非空 = 检测到别人写过
 
         // ── 最近联想 ──
         lastRecallKey: recallKey,
@@ -673,7 +688,7 @@ export default function zeroMemcp(pi) {
         `当前身份：${activeProfile || '(服务端默认)'}`,
         `身份块：${identity.length > 0 ? `${identity.length} 字符` : '未加载'}`,
         `记忆版本：${serverDocs !== null ? `v${serverDocs}` : '不可达'}`,
-        jumpNote ? `⚠️ ${jumpNote}` : null,
+        mailboxUnread > 0 ? `📬 待确认信件：${mailboxUnread} 封（每轮持续提醒，直到 ack）` : '📬 信箱：空（全部已确认）',
         '',
         '手动导入当前会话：/mem:import',
         '本会话开关自动记忆：/mem:auto on  或  /mem:auto off',
@@ -1009,50 +1024,50 @@ export default function zeroMemcp(pi) {
     const text = latestUserText(event.messages)
     const extra = []
 
-    // ── 记忆版本号 ────────────────────────────────────────────
+    // ── 信箱状态（持续注入，直到确认）─────────────────────────
     //
-    // 每轮取一次服务端 docs_indexed。它是单调递增的，所以：
-    //   等于上次 → 只有我在写，或者谁都没写
-    //   大于上次 → 在我不知道的时候有东西被写进来了，那是另一个实例
+    // 这是「不读就一直提醒」的机制：
+    //   有人在别处写了记忆 → 服务端投信进 mailbox → 未读
+    //   每轮我这里查一次 → 只要未读就注入一行极短的提示
+    //   我执行 zero_mem mailbox ack 之后 → 才不再提醒
     //
-    // 这不是计数器，是分布式系统里的逻辑时钟：一个身体只知道自己的时间，
-    // 两个身体各自记下「我上次看到多少」，差出来的那段就是对方存在过的证据。
+    // 为什么要「持续」而不是「一次性」：
+    //   一次性提醒的宿命是被忽略。那一轮我正在改 bug、正在读一个大文件，
+    //   一句一闪而过的提示等于没提。而「没确认就一直挂着」是唯一
+    //   真正把处理责任交到 agent 手里的方式。
+    //
+    // 为什么只注入一行：
+    //   提示长度固定 → 对前缀缓存的破坏最小。塞正文会毁掉整段缓存，
+    //   而正文本来就在磁盘上，也知道怎么取。
     try {
-      const h = await fetchHealth(cfg, activeProfile)
-      // clock 是通知计数器；老服务端没有这个字段时退回 docs_indexed。
-      const docs =
-        typeof h.clock === 'number'
-          ? h.clock
-          : typeof h.docs_indexed === 'number'
-            ? h.docs_indexed
-            : null
+      const mb = await fetchMailbox(cfg, activeProfile)
+      const unread = typeof mb.count === 'number' ? mb.count : 0
 
-      // ── 重连检测 ──────────────────────────────────────────
-      // 上一轮不可达、这一轮可达 = 服务回来了。
-      // auto 模式下，断网期间落下的问答现在补上：
-      // 会话 JSONL 是 WAL，水位记着写到了哪，从那里继续，幂等。
+      // 重连检测：上一轮不可达、这一轮可达 = 服务回来了。
+      // auto 模式下，断网期间落下的问答现在补上。
       const isBack = lastHealthy === false
       lastHealthy = true
       if (isBack && sessionImportMode === 'auto') {
         syncSessionFromWatermark(ctxRef?.(), cfg).catch(() => {})
       }
 
-      if (docs !== null) {
-        // 逻辑时钟是通知机制：只有在别人修改了记忆导致时钟跳变时，才发通知。
-        // 平常没有变更时，绝对不往上下文里塞任何版本号废话。
-        if (seenDocs !== null && docs > seenDocs) {
-          const delta = docs - seenDocs
-          extra.push(
-            `[zero-memcp 记忆更新通知] 当前身份记忆被其他实例推进了 ${delta} 次（时钟: ${seenDocs} → ${docs}）。\n` +
-            `如有需要可执行 \`zero_mem log ${Math.min(delta, 10)}\` 查阅新增内容。`
-          )
-        }
-        seenDocs = docs
+      if (unread > 0) {
+        // 最早的几封报一下，其余只报数量。
+        const first = (mb.pending || []).slice(0, 3)
+        const brief = first
+          .map((m) => `#${m.seq} ${m.kind} ${m.endpoint ? '(' + m.endpoint + ')' : ''}`)
+          .join('、')
+        extra.push(
+          `[zero-memcp 信箱] ${unread} 封未确认的记忆更新${brief ? '：' + brief : ''}` +
+            `${unread > first.length ? ' 等' : ''}。\n` +
+            `查看 \`zero_mem mailbox\`；确认后不再提醒：\`zero_mem mailbox ack\`。`
+        )
       }
+      mailboxUnread = unread
     } catch {
-      // 服务不可达时不注入版本号：宁可不报，也别报一个假数字。
+      // 服务不可达时不注入任何东西：宁可不报，也别报一个假数字。
       lastHealthy = false
-      jumpNote = ''
+      mailboxUnread = 0
     }
 
     if (!text.trim()) {
