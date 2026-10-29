@@ -1,0 +1,6 @@
+{
+  "name": "zero-memcp-extension",
+  "private": true,
+  "type": "module",
+  "main": "index.js"
+}
