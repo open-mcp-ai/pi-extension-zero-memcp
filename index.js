@@ -53,6 +53,103 @@ const CLOCK_FILE = process.env.ZERO_MEMCP_CLOCK || join(homedir(), '.zero-memcp'
 // 水位只有一个小整数，永远只有一条。
 const WM_DIR = process.env.ZERO_MEMCP_WM_DIR || join(homedir(), '.zero-memcp', 'wm')
 
+// ── SSE 实时推送与唤醒 ──
+//
+// 为什么需要主动推送：
+//   没有它，agent 只能靠「轮到自己那一轮」去轮询 mailbox。而空闲的
+//   智能体没有任何一轮——它不会自己醒来。QQ、群聊这类外部消息需要
+//   一到就唤醒，这个动作只能由常驻监听器发起。
+//
+// 三条克制规则：
+//   1. agent 正在思考（busy）时绝不打断，未读自然出现在下一轮 context；
+//   2. 两次唤醒至少间隔 3 秒，群聊刷屏不至于变成死循环；
+//   3. 掉线指数退避重连（1s → 2s → … → 30s 封顶）。
+function startSSEListener(pi, getCfg, getProfile, onMailCount) {
+  let abortCtrl = null
+  let retryDelay = 1000
+  let lastWakeAt = 0
+  let busy = false
+
+  pi.on('agent_start', () => { busy = true })
+  pi.on('agent_end', () => { busy = false })
+
+  async function connect() {
+    const cfg = getCfg()
+    const profile = getProfile()
+    const url = profile
+      ? `${cfg.endpoint}/events?profile=${encodeURIComponent(profile)}`
+      : `${cfg.endpoint}/events`
+
+    abortCtrl = new AbortController()
+    let connected = false
+    try {
+      const res = await fetch(url, {
+        headers: { Accept: 'text/event-stream' },
+        signal: abortCtrl.signal,
+      })
+      if (!res.ok) throw new Error(`SSE ${res.status}`)
+      connected = true
+      retryDelay = 1000
+
+      const reader = res.body.getReader()
+      const decoder = new TextDecoder()
+      let buf = ''
+
+      for (;;) {
+        const { value, done } = await reader.read()
+        if (done) break
+        buf += decoder.decode(value, { stream: true })
+        const blocks = buf.split('\n\n')
+        buf = blocks.pop()
+
+        for (const block of blocks) {
+          if (!block.trim() || block.startsWith(':')) continue
+          let evName = 'message'
+          let dataStr = ''
+          for (const line of block.split('\n')) {
+            if (line.startsWith('event: ')) evName = line.slice(7).trim()
+            else if (line.startsWith('data: ')) dataStr = line.slice(6).trim()
+          }
+          if (evName === 'mail' && dataStr) {
+            try { onMail(JSON.parse(dataStr)) } catch {}
+          }
+        }
+      }
+    } catch (err) {
+      if (err && err.name === 'AbortError') return
+    } finally {
+      if (!connected || true) {
+        setTimeout(connect, retryDelay)
+        retryDelay = Math.min(retryDelay * 2, 30000)
+      }
+    }
+  }
+
+  function onMail(ev) {
+    // 无论唤不唤醒，先让下一轮的 context 提示反映最新未读数。
+    // 只唤醒不计数，会出现「已经提示过了但下一轮还显示旧数字」。
+    try { onMailCount && onMailCount(ev) } catch {}
+
+    const now = Date.now()
+    if (busy) return
+    if (now - lastWakeAt < 3000) return
+    lastWakeAt = now
+    // 唤醒词是固定短语，绝不拼接外部正文——消息内容必须通过
+    // MCP 工具读回来，才会落在 tool_result 的沙盒里。
+    try {
+      if (typeof pi.sendUserMessage === 'function') {
+        pi.sendUserMessage(
+          `[zero-memcp] 有新的外部记忆 (#${ev.seq} ${ev.kind} 来自 ${ev.endpoint || 'unknown'})，调用 term("mailbox") 查看`
+        )
+      }
+    } catch {}
+  }
+
+  connect()
+
+  return () => { if (abortCtrl) abortCtrl.abort() }
+}
+
 // 会话级覆盖设置。
 //
 // 全局 importMode 是一个默认值，不是命令。真正决定「这一条会话记不记」
@@ -566,6 +663,15 @@ export default function zeroMemcp(pi) {
   //
   // 为什么要有这个：默认不记忆时，「记下来」必须是**用户能做的一件事**，
   // 不是「等我（模型）觉得该记的时候再记」。判断权归用户，执行权在这里。
+  // 启动常驻 SSE 监听（断线自愈，进程存活期间一直在）
+  // cfg 是 promise：每次重连都重新读一次，配置改了不用重启。
+  let cachedCfg = { endpoint: 'http://127.0.0.1:1729' }
+  cfgPromise.then((c) => { cachedCfg = c }).catch(() => {})
+  startSSEListener(pi, () => cachedCfg, () => activeProfile, () => {
+    // SSE 事件到达即说明信箱至少有 1 封未读；精确数字留给下一轮 fetchMailbox 校准。
+    if (mailboxUnread === 0) mailboxUnread = 1
+  })
+
   pi.registerCommand('mem:import', {
     description: '把当前会话的全部问答对导入记忆库（按内容去重）',
     handler: async (_args, cmdCtx) => {
