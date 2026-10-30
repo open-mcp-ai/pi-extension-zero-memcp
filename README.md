@@ -48,29 +48,38 @@ ln -s /path/to/pi-extension-zero-memcp ~/.pi/agent/extensions/zero-memcp
 
 ## 命令
 
-用户在 TUI 中可直接使用的斜杠命令：
+用户在 TUI 输入框中可使用的 3 个斜杠命令：
 
-- `/mem:import` — 手动把当前会话全部问答导入记忆库（按内容 checksum CAS 幂等）；
-- `/mem:auto on|off` — 仅为当前会话开启或关闭每轮自动记忆（不影响其他会话）；
-- `/mem:profile <name>` — 切换记忆身份（分支名，空参 = 默认身份）；
-- `/mem:role` — **列出凭证里的全部角色**（名称、能力、挂载表），当前角色带标记；
-- `/mem:role <name>` — 切换并锁定本会话角色（写入本会话元数据，重启后自动恢复）。
+- `/mem:role` — **身份**：空参列出凭证内全部可用角色（名称、能力位、挂载表，当前角色带标记）；`/mem:role <name>` 切换并锁定本会话角色（写入会话元数据，重启后自动恢复）；
+- `/mem:sync` — **同步到记忆体**：手动把当前会话全部问答导入记忆库（按内容 checksum CAS 幂等，无重复开销）；
+- `/mem:mode` — **记忆模式**：空参查看当前模式；`/mem:mode [auto|manual|off]` 切换本会话模式。
 
----
+## 暴露给模型的工具（只有一个）
 
-## 暴露给模型的工具
+遵循 termcp 规范：**声明面恒定为 1，能力增长在命令空间，不在 `tools/list` 堆工具**。
 
-模型可在推理中自主调用的 5 个工具：
+模型在整个会话中只能看到一个工具：
 
-| 工具名 | 参数 | 说明 |
+```
+mem({ cmd: "recall 数据库选型" })
+```
+
+### 命令语法
+
+| 类别 | 动词 | 说明 |
 |---|---|---|
-| `zero_mem` | `{cmd}` | termcp 协议单入口（`recall`/`read`/`grep`/`log`/`ls`/`note`/`status`） |
-| `zero_mem_set_mode` | `{mode: "off"\|"manual"\|"auto"}` | 模型自主调整本会话记忆模式 |
-| `zero_mem_set_profile` | `{name: string}` | 模型自主切换身份分支 |
-| `zero_mem_import` | `{}` | 模型自主导入当前会话 |
-| `zero_mem_status` | `{}` | 查询插件状态、开关、身份与逻辑时钟 |
-
----
+| **会话管理**（插件处理） | `mem status` | 当前端点、角色、模式、逻辑时钟、未读信箱 |
+| | `mem mode [auto\|manual\|off]` | 模型自主调整本会话记忆模式 |
+| | `mem sync` | 模型自主触发把本会话问答同步进记忆库 |
+| | `mem role [<name>]` | 查看/切换本会话角色 |
+| **记忆检索**（透传服务） | `mem recall <text>` | BM25 语义搜（返回地址 + 摘要片段） |
+| | `mem read <addr>...` | 读全文，可一次多篇 |
+| | `mem grep <regex>` | 正则精确搜符号/数字/函数名 |
+| | `mem log [N]` | 最近 N 篇 |
+| | `mem ls [date]` | 列某天的切片 |
+| **记忆写入**（透传服务） | `mem note <kind> -- <text>` | 追加切片（fact/episode/preference/observation） |
+| | `mem commit [<p>[@<br>]]` | 显式封箱（引擎绝不自动提交） |
+| | `mem diff <p>@<br>` | 分支比对 / 提取未审脏流 |
 
 ## 记忆模式说明
 

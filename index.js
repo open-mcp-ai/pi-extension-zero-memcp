@@ -597,208 +597,14 @@ export default function zeroMemcp(pi) {
   // 记忆入口工具。
   //
   // 只有一个，动词在 cmd 里——和 zero-memcp 的 term 协议同构。
-  // 逐个注册 recall/read/note 会让工具表变长、每轮都占提示词预算，
-  // 而它们其实是同一个服务的三个动词。
-  //
-  // 为什么由插件提供而不是靠 MCP 挂载：MCP 是会话级配置，换个目录就没了，
-  // 而"该写的时候手里没有笔"会让 SKILL.md 里那条写入判据变成一句空话。
-  // 插件是唯一必然加载的通道。
-  //
-  // 什么时候写仍然由模型决定——这里只提供能力，不做判断。
-  pi.registerTool({
-    name: "zero_mem",
-    label: "Zero Mem",
-    description: [
-      "zero-memcp 记忆库：查过去、架构、主人、踩坑、决定优先用它，不要用 bash 翻磁盘。",
-      "",
-      "  recall <text>            语义搜",
-      "  read <addr> [<addr>...]  读全文",
-      "  grep <pattern>           正则精确搜（符号/数字/IP 用它）",
-      "  log [N]                  最近 N 篇",
-      "  ls [date]                某天的全部切片",
-      "  note <kind> -- <text>    写一条",
-      "  status                   索引规模",
-      "",
-      "不知道用哪个就调 help，不知道该问什么就传空字符串——都会返回完整说明。",
-    ].join("\n"),
-    parameters: {
-      type: "object",
-      properties: {
-        cmd: {
-          type: "string",
-          description: "命令行，例如 'recall napcat 端口' 或 'read skills/01-me/03-method.md'",
-        },
-      },
-      required: ["cmd"],
-      additionalProperties: false,
-    },
-    async execute(_toolCallId, params) {
-      const cfg = await cfgPromise
-      if (!cfg.enabled) throw new Error("zero-memcp 已禁用")
-      const cmd = String(params.cmd || "").trim()
-      if (!cmd) throw new Error("cmd 不能为空")
-      // read 可能读长文，给宽一点；其余都是毫秒级。
-      const timeout = cmd.startsWith("read ") ? 10000 : 5000
-      const out = await term(cfg, cmd, timeout)
-      return {
-        content: [{ type: "text", text: out || "(无输出)" }],
-        details: { cmd },
-      }
-    },
-  })
+  // ── 用户斜杠命令 ──────────────────────────────────────────
 
-  // 自检工具：让模型（我）能看见插件这一侧的实际状态。
-  // 没有它，注入成功与否只能靠猜——而"以为注入了其实没有"正是最难发现的失败。
-  // 切换/创建身份。
-  //
-  // 名字不进上下文：它只是下一次 HTTP 请求的 query 参数。
-  // 模型（和用户）看到的差别是——身份块变了，联想结果变了，落盘目标变了。
-  // 谁在问、用哪份记忆，由配置和这个工具决定，不由对话内容决定。
-  // 调整当前会话的记忆模式（模型可调）。
-  // 当用户说「把接下来的对话都记下来」或「不要记了」时调用。
-  pi.registerTool({
-    name: "zero_mem_set_mode",
-    label: "Zero Mem Set Mode",
-    description: "设置当前会话的记忆模式：off（不记）/ manual（手动导入）/ auto（每轮自动落盘）。只影响当前会话。",
-    parameters: {
-      type: "object",
-      properties: {
-        mode: {
-          type: "string",
-          enum: ["off", "manual", "auto"],
-          description: "目标模式",
-        },
-      },
-      required: ["mode"],
-      additionalProperties: false,
-    },
-    async execute(_id, params) {
-      const mode = String(params.mode || "off")
-      sessionImportMode = mode
-      await saveSessionSetting(sessionId, { importMode: mode })
-      return {
-        content: [{ type: "text", text: `当前会话模式已设为：${mode}` }],
-        details: { mode, sessionId },
-      }
-    },
-  })
-
-  pi.registerTool({
-    name: "zero_mem_set_profile",
-    label: "Zero Mem Set Profile",
-    description: [
-      "切换或创建记忆身份（profile）。每个身份是一套独立的 me/ + daily/。",
-      "传空串回到服务端默认身份。",
-      "切换后下一次轮次生效：身份块、联想、写入目标全部跟着换。",
-    ].join("\n"),
-    parameters: {
-      type: "object",
-      properties: {
-        name: { type: "string", description: "身份名，例如 zero / project-x。空串 = 默认身份" },
-      },
-      required: ["name"],
-      additionalProperties: false,
-    },
-    async execute(_id, params) {
-      const cfg = await cfgPromise
-      if (!cfg.enabled) throw new Error("zero-memcp 已禁用")
-      const name = String(params.name || "").trim()
-
-      // 身份即分支：服务端按分支存记忆，新身份不需要预先创建，
-      // 第一次写入时分支自然出现。插件不碰文件系统。
-      activeProfile = name
-      // 身份块作废，下一轮按新身份取
-      identity = ''
-      identityAt = 0
-      identityError = null
-      return {
-        content: [{ type: "text", text: name ? `身份已切换：${name}` : "已切回默认身份" }],
-        details: { profile: name },
-      }
-    },
-  })
-
-  // 手动导入：把当前会话的全部问答对补进记忆库。
-  //
-  // importMode=off（默认）时这是唯一的写入通道之一——用户明确说
-  // "把这个会话记下来"，才落盘。
-  pi.registerTool({
-    name: "zero_mem_import",
-    label: "Zero Mem Import",
-    description: "把当前会话的全部问答对补进当前身份的记忆库。按内容 checksum 去重，重复调用安全。",
-    parameters: { type: "object", properties: {}, additionalProperties: false },
-    async execute() {
-      const cfg = await cfgPromise
-      if (!cfg.enabled) throw new Error("zero-memcp 已禁用")
-      const n = await syncSessionFromWatermark(cfg)
-      return {
-        content: [{ type: "text", text: n > 0 ? `已写入 ${n} 条` : "没有新的问答对需要写入（全部已存在或为空）" }],
-        details: { written: n },
-      }
-    },
-  })
-
-  // 用户手动命令：在输入框里打 /mem:import 就把本会话写进记忆库。
-  //
-  // 为什么要有这个：默认不记忆时，「记下来」必须是**用户能做的一件事**，
-  // 不是「等我（模型）觉得该记的时候再记」。判断权归用户，执行权在这里。
-  // 启动常驻 SSE 监听（断线自愈，进程存活期间一直在）
-  // cfg 是 promise：每次重连都重新读一次，配置改了不用重启。
-  let cachedCfg = { endpoint: 'http://127.0.0.1:1729' }
-  cfgPromise.then((c) => { cachedCfg = c }).catch(() => {})
-  startSSEListener(pi, () => cachedCfg, () => activeProfile, () => {
-    // SSE 事件到达即说明信箱至少有 1 封未读；精确数字留给下一轮 fetchMailbox 校准。
-    if (mailboxUnread === 0) mailboxUnread = 1
-  })
-
-  pi.registerCommand('mem:import', {
-    description: '把当前会话的全部问答对导入记忆库（按内容去重）',
-    handler: async (_args, cmdCtx) => {
-      const cfg = await cfgPromise
-      if (!cfg.enabled) {
-        cmdCtx?.ui?.notify?.('zero-memcp 已禁用', 'warning')
-        return
-      }
-      // 命令回调手里的 cmdCtx 是新鲜的，优先用它。
-      let n = 0
-      try {
-        n = await syncSessionFromWatermark(cfg, cmdCtx)
-      } catch (err) {
-        cmdCtx?.ui?.notify?.(`导入失败：${err}`, 'error')
-        return
-      }
-      cmdCtx?.ui?.notify?.(n > 0 ? `已导入 ${n} 条问答` : '没有新的问答需要导入', 'info')
-    },
-  })
-
-  // 控制本会话是否开启自动记忆。只影响当前会话，其他会话仍走默认。
-  pi.registerCommand('mem:auto', {
-    description: '设置当前会话的自动落盘：/mem:auto [on|off|status]（默认 off）',
-    handler: async (args, cmdCtx) => {
-      const arg = String(args || '').trim().toLowerCase()
-      if (arg === 'on') {
-        sessionImportMode = 'auto'
-        await saveSessionSetting(sessionId, { importMode: 'auto' })
-        cmdCtx?.ui?.notify?.('已为【当前会话】开启自动记忆（每轮落盘）', 'info')
-      } else if (arg === 'off') {
-        sessionImportMode = 'off'
-        await saveSessionSetting(sessionId, { importMode: 'off' })
-        cmdCtx?.ui?.notify?.('已为【当前会话】关闭自动记忆（默认不落盘）', 'info')
-      } else {
-        const cur = sessionImportMode || 'off'
-        cmdCtx?.ui?.notify?.(`当前会话模式：${cur === 'auto' ? '自动记忆' : '默认不记'}（用法：/mem:auto on 或 off）`, 'info')
-      }
-    },
-  })
-
-  // 切换身份的快捷命令
   pi.registerCommand('mem:role', {
-    description: '切换本会话角色：/mem:role <name>（空参 = 列出全部可用角色）',
+    description: '身份：/mem:role <name>（空参 = 列出全部可用角色）',
     handler: async (args, cmdCtx) => {
       const cfg = await cfgPromise
       const role = String(args || '').trim()
 
-      // 空参 = 列出清单。清单来自凭证自己，不需要问服务端。
       if (!role) {
         const info = rolesOf(cfg.token)
         if (!info) {
@@ -806,134 +612,191 @@ export default function zeroMemcp(pi) {
           return
         }
         const text = renderRoles(info, activeRole)
-        // notify 一行放不下，清单走日志/消息区
         if (cmdCtx?.ui?.message) cmdCtx.ui.message(text)
         else cmdCtx?.ui?.notify?.(text, 'info')
         return
       }
 
-      // 校验角色确实存在：写错名字当场报错，而不是等第一次写记忆时
-      // 才收到一个「未知角色」的 403——那时用户已经在做别的事了。
       const info = rolesOf(cfg.token)
-      if (info && Object.keys(info.roles).length > 0) {
-        if (!info.roles[role]) {
-          const avail = Object.keys(info.roles).sort().join(', ')
-          cmdCtx?.ui?.notify?.(`没有 "${role}" 这个角色。可用：${avail}`, 'error')
-          return
-        }
+      if (info && Object.keys(info.roles).length > 0 && !info.roles[role]) {
+        const avail = Object.keys(info.roles).sort().join(', ')
+        cmdCtx?.ui?.notify?.(`没有 "${role}" 这个角色。可用：${avail}`, 'error')
+        return
       }
 
       activeRole = role
-      if (sessionId) {
-        await saveSessionSetting(sessionId, { role })
-      }
-      // 角色切换影响能看到什么，身份块与联想缓存必须作废
+      if (sessionId) await saveSessionSetting(sessionId, { role })
       identity = ''
       identityAt = 0
       identityError = null
-      cmdCtx?.ui?.notify?.(`会话角色已锁定为: ${role}（写入本会话元数据）`, 'info')
+      cmdCtx?.ui?.notify?.(`会话角色已锁定为: ${role}`, 'info')
     },
   })
 
-  pi.registerCommand('mem:profile', {
-    description: '切换记忆身份：/mem:profile <name>（空参 = 默认身份）',
+  pi.registerCommand('mem:sync', {
+    description: '同步到记忆体：把当前会话全部问答导入记忆库（按内容去重）',
+    handler: async (_args, cmdCtx) => {
+      const cfg = await cfgPromise
+      if (!cfg.enabled) {
+        cmdCtx?.ui?.notify?.('zero-memcp 已禁用', 'warning')
+        return
+      }
+      let n = 0
+      try {
+        n = await syncSessionFromWatermark(cfg, cmdCtx)
+      } catch (err) {
+        cmdCtx?.ui?.notify?.(`同步失败：${err}`, 'error')
+        return
+      }
+      cmdCtx?.ui?.notify?.(n > 0 ? `已同步 ${n} 条问答到记忆体` : '已是最新，无新内容需要同步', 'info')
+    },
+  })
+
+  pi.registerCommand('mem:mode', {
+    description: '记忆模式：/mem:mode [auto|manual|off]（空参 = 查看当前模式）',
     handler: async (args, cmdCtx) => {
       const cfg = await cfgPromise
-      if (!cfg.enabled) return
-      const name = String(args || '').trim()
-      activeProfile = name
-      identity = ''
-      identityAt = 0
-      identityError = null
-      cmdCtx?.ui?.notify?.(name ? `身份已切换：${name}` : '已切回默认身份', 'info')
+      const val = String(args || '').trim().toLowerCase()
+      const current = sessionImportMode || cfg.importMode
+
+      if (!val) {
+        cmdCtx?.ui?.notify?.(`当前记忆模式: ${current}（全局默认: ${cfg.importMode}）`, 'info')
+        return
+      }
+      if (!['auto', 'manual', 'off', 'on'].includes(val)) {
+        cmdCtx?.ui?.notify?.('模式仅支持：auto（每轮落盘）、manual（只手动同步）、off（不记录）', 'warning')
+        return
+      }
+      const target = val === 'on' ? 'auto' : val
+      sessionImportMode = target
+      if (sessionId) await saveSessionSetting(sessionId, { importMode: target })
+      cmdCtx?.ui?.notify?.(`本会话记忆模式已切换为: ${target}`, 'info')
     },
   })
 
+  // ── 工具：只有一个 mem ────────────────────────────────────
+  //
+  // 声明面恒定为 1，能力增长在命令空间，不在 tools/list。
+  //
+  // 五个工具（zero_mem / _set_mode / _set_profile / _import / _status）
+  // 拆开注册的代价是每轮都多几百字符的 schema，而模型真正需要的只是
+  // 「说一句话就能查/写/查状态」。把动词做成参数，schema 只写一次。
+  //
+  // 本地动词（mode/sync/status/role）由插件处理，其余整行透传服务端——
+  // 插件的职责是「在合适的时机加上下文和写入」，不是替服务端实现记忆。
   pi.registerTool({
-    name: "zero_mem_status",
-    label: "Zero Mem Status",
+    name: "mem",
+    label: "Memory",
     description: [
-      "查看 zero-memcp 在 pi 插件侧的状态：开关、身份、身份块、记忆版本号、最近联想。",
-      "想知道「现在记不记忆」「我是什么身份」「记忆库有没有被别人写过」时用它。",
+      "长期记忆库（zero-memcp）。查过去、架构、主人、踩坑、决定优先用它，不要用 bash 翻磁盘。",
+      "",
+      "  recall <text>            语义搜",
+      "  read <addr> [<addr>...]  读全文",
+      "  grep <pattern>           正则精确搜（符号/数字/IP 用它）",
+      "  log [N]                  最近 N 篇",
+      "  ls [date]                列出某天的切片",
+      "  note <kind> -- <text>    写一条（fact/episode/preference/observation）",
+      "  commit [<p>[@<br>]]      封箱（引擎不会自动提交）",
+      "  diff <p>@<br> [-> <p>@<br>]  分支比对",
+      "",
+      "会话管理（插件就地处理）：",
+      "  status                   当前角色、模式、时钟、信箱",
+      "  mode [auto|manual|off]   查看/设置本会话记忆模式",
+      "  sync                     把本会话问答同步进记忆库",
+      "  role [<name>]            列出/切换本会话身份",
+      "",
+      "不知道用哪个：问「关于X我之前怎么想的」→ recall；",
+      "找精确串 → grep；问「最近做到哪了」→ log。",
     ].join("\n"),
-    parameters: { type: "object", properties: {}, additionalProperties: false },
-    async execute() {
+    parameters: {
+      type: "object",
+      properties: {
+        cmd: {
+          type: "string",
+          description: "命令行，例如 'recall napcat 端口' 或 'note fact -- 端口 1729'",
+        },
+      },
+      required: ["cmd"],
+      additionalProperties: false,
+    },
+    async execute(_toolCallId, params) {
       const cfg = await cfgPromise
-
-      // 服务端状态：身份名不进上下文，但状态自检要能看到——
-      // 这是给我自己排障用的，不是给模型推理用的。
-      let serverDocs = null
-      let serverErr = null
-      try {
-        const h = await fetchHealth(cfg, activeProfile)
-        serverDocs = typeof h.clock === 'number' ? h.clock : typeof h.docs_indexed === 'number' ? h.docs_indexed : null
-      } catch (err) {
-        serverErr = String(err)
+      const line = String(params.cmd || "").trim()
+      if (!line) {
+        return { content: [{ type: "text", text: "空命令。试 'status' 或 'recall <关键词>'" }] }
       }
 
-      const snapshot = {
-        // ── 开关 ──
-        enabled: cfg.enabled,
-        // 本会话实际生效的模式（会话级 > 全局）
-        importMode: sessionImportMode || cfg.importMode,
-        globalImportMode: cfg.importMode,     // 全局默认，仅供参考
-        autoWrite: (sessionImportMode || cfg.importMode) === 'auto',
-        syncSessionOnStart: cfg.syncSessionOnStart,
+      const verb = line.split(/\s+/)[0]
+      const arg = line.slice(verb.length).trim()
 
-        // ── 身份 ──
-        profile: activeProfile || '(服务端默认)',
-        skipSubagent: skip,
-        identityLoaded: identity.length > 0,
-        identityChars: identity.length,
-        identityAgeMs: identityAt ? Date.now() - identityAt : null,
-        identityError: identityError ? String(identityError) : null,
+      // ── 本地动词 ──
+      switch (verb) {
+        case 'mode': {
+          if (!arg) {
+            const cur = sessionImportMode || cfg.importMode
+            return { content: [{ type: "text", text: `当前记忆模式: ${cur}（全局默认: ${cfg.importMode}）` }] }
+          }
+          const m = arg === 'on' ? 'auto' : arg
+          if (!['auto', 'manual', 'off'].includes(m)) {
+            return { content: [{ type: "text", text: "模式仅支持 auto / manual / off" }], isError: true }
+          }
+          sessionImportMode = m
+          if (sessionId) await saveSessionSetting(sessionId, { importMode: m })
+          return { content: [{ type: "text", text: `本会话记忆模式已设为 ${m}` }] }
+        }
 
-        // ── 信箱 ──
-        mailboxUnread,                         // 未确认信件数（>0 时每轮持续提示）
+        case 'sync': {
+          let n = 0
+          try { n = await syncSessionFromWatermark(cfg) } catch (err) {
+            return { content: [{ type: "text", text: `同步失败：${err}` }], isError: true }
+          }
+          return { content: [{ type: "text", text: n > 0 ? `已同步 ${n} 条` : '已是最新' }] }
+        }
 
-        // ── 记忆版本号（逻辑时钟）──
-        serverDocs,                            // 服务端此刻的读数
-        seenDocs,                              // 我这轮看到的
+        case 'role': {
+          const info = rolesOf(cfg.token)
+          if (!arg) {
+            if (!info) return { content: [{ type: "text", text: '凭证里没有角色信息' }] }
+            return { content: [{ type: "text", text: renderRoles(info, activeRole) }] }
+          }
+          if (info && Object.keys(info.roles).length > 0 && !info.roles[arg]) {
+            const avail = Object.keys(info.roles).sort().join(', ')
+            return { content: [{ type: "text", text: `没有 "${arg}" 这个角色。可用：${avail}` }], isError: true }
+          }
+          activeRole = arg
+          if (sessionId) await saveSessionSetting(sessionId, { role: arg })
+          identity = ''
+          identityAt = 0
+          identityError = null
+          return { content: [{ type: "text", text: `会话角色已锁定为 ${arg}` }] }
+        }
 
-        // ── 最近联想 ──
-        lastRecallKey: recallKey,
-        lastRecallHits: recallHits.map((h) => h.addr),
-
-        endpoint: cfg.endpoint,
-        serverError: serverErr,
+        case 'status': {
+          let clock = null
+          let err = null
+          try {
+            const h = await fetchHealth(cfg, activeProfile)
+            clock = typeof h.clock === 'number' ? h.clock : null
+          } catch (e) { err = String(e) }
+          const lines = [
+            `端点: ${cfg.endpoint}`,
+            `角色: ${activeRole || '（Token 默认）'}`,
+            `记忆模式: ${sessionImportMode || cfg.importMode}`,
+            `总线: ${clock === null ? `不可达 (${err})` : clock}`,
+            `信箱: ${mailboxUnread} 封未读`,
+          ]
+          return { content: [{ type: "text", text: lines.join("\n") }] }
+        }
       }
 
-      // 人读的一段摘要放在最上面，JSON 留给排障。
-      const lines = [
-        `记忆开关：${(sessionImportMode || cfg.importMode) === 'off' ? '关（默认不写入）' : (sessionImportMode || cfg.importMode) === 'manual' ? '手动（/mem:import 才写）' : '自动（每轮落盘）'}   〔仅本会话〕`,
-        `当前身份：${activeProfile || '(服务端默认)'}`,
-        `身份块：${identity.length > 0 ? `${identity.length} 字符` : '未加载'}`,
-        `记忆版本：${serverDocs !== null ? `v${serverDocs}` : '不可达'}`,
-        mailboxUnread > 0 ? `📬 待确认信件：${mailboxUnread} 封（每轮持续提醒，直到 ack）` : '📬 信箱：空（全部已确认）',
-        '',
-        '手动导入当前会话：/mem:import',
-        '本会话开关自动记忆：/mem:auto on  或  /mem:auto off',
-        '切换身份：/mem:profile <name>',
-      ].filter((x) => x !== null)
-
-      return {
-        content: [
-          { type: "text", text: lines.join('\n') },
-          { type: "text", text: '```json\n' + JSON.stringify(snapshot, null, 2) + '\n```' },
-        ],
-        details: snapshot,
+      // ── 其余动词透传服务端 ──
+      if (!cfg.enabled) {
+        return { content: [{ type: "text", text: 'zero-memcp 已禁用' }], isError: true }
       }
+      const out = await term(cfg, line, 8000, activeProfile)
+      return { content: [{ type: "text", text: out || '(无输出)' }] }
     },
   })
-
-  // 把 zero-memcp 直接注册成 MCP server。
-  //
-  // 不经 termcp：termcp 是控制平面（够到别的机器），记忆是数据平面
-  // （本机、每轮、毫秒级）。绕一层只会多一跳，还会让记忆依赖 termcp 的存活。
-  //
-  // 注册在这里而不是工厂里：文档明确要求长生命周期资源从 session_start 起，
-  // 因为有些调用会加载扩展但不开会话。
-  let mcpRegistered = false
 
   pi.on('session_start', async (event, ctx) => {
     cfgPromise = loadConfig()
