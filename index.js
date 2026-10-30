@@ -702,7 +702,6 @@ export default function zeroMemcp(pi) {
       "会话管理（插件就地处理）：",
       "  status                   当前角色、模式、时钟、信箱",
       "  mode [auto|manual|off]   查看/设置本会话记忆模式",
-      "  （同步整场会话由用户在输入框执行 /mem:sync，模型禁止自主触发）",
       "  role [<name>]            列出/切换本会话身份",
       "",
       "不知道用哪个：问「关于X我之前怎么想的」→ recall；",
@@ -743,19 +742,6 @@ export default function zeroMemcp(pi) {
           sessionImportMode = m
           if (sessionId) await saveSessionSetting(sessionId, { importMode: m })
           return { content: [{ type: "text", text: `本会话记忆模式已设为 ${m}` }] }
-        }
-
-        case 'sync': {
-          // 模型禁止自主同步整场会话：全量落盘属于重度写操作，
-          // 必须由人类裁决。模型应该做的是在回复里询问用户，
-          // 引导用户敲 /mem:sync，而不是替用户作主。
-          return {
-            content: [{
-              type: "text",
-              text: "同步全会话属于重度持久化操作，模型禁止自主触发。如果认为当前会话值得归档，请在回复中询问用户，引导用户在输入框执行 /mem:sync。"
-            }],
-            isError: true,
-          }
         }
 
         case 'role': {
