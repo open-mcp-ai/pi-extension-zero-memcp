@@ -187,10 +187,10 @@ const DEFAULTS = {
   syncSessionOnStart: false,
   // 导入模式：off（默认，什么都不写）/ manual（只响应 /mem:import）/ auto（每轮落盘）
   importMode: 'off',
-  // 身份挂载：off（默认关闭，保持普通编码助手）/ on（新会话默认挂载 Zero 身份）
+  // 身份挂载：off（默认关闭，保持普通编码助手）/ on（新会话默认挂载身份）
   //
-  // 为什么默认关：机器上有很多普通会话，不是每个都属于 Zero。
-  // 默认挂载会把所有对话都当成 Zero 的，既污染上下文也污染记忆库。
+  // 为什么默认关：机器上有很多普通会话，不是每个都属于某个身份。
+  // 默认挂载会把所有对话都当成那个身份的，既污染上下文也污染记忆库。
   //
   // 可以通过 /mem:identity on 随时为本会话挂载，
   // 也可以通过 /mem:identity global on 开启全局默认。
@@ -601,11 +601,11 @@ export default function zeroMemcp(pi) {
   let skip = false
 
   // 本条会话的身份挂载状态。null 表示跟随全局 config.identity。
-  // 'on' = 这场对话认领为 Zero（挂载身份、联想记忆、允许落盘）
-  // 'off' = 普通会话（纯净助手，不挂载身份、不联想、不自动落盘）
+  // 'on' = 这场对话认领身份（挂载规则块、联想记忆、允许落盘）
+  // 'off' = 普通会话（纯净助手，不挂载、不联想、不自动落盘）
   let sessionIdentity = null
 
-  /** 当前会话是否挂载了 Zero 身份。会话级设置优先于全局。 */
+  /** 当前会话是否挂载了身份。会话级设置优先于全局。 */
   const identityActive = (cfg) => {
     const v = sessionIdentity ?? cfg.identity ?? 'off'
     return v === 'on' || v === 'auto' || v === true
@@ -740,13 +740,13 @@ export default function zeroMemcp(pi) {
   })
 
   pi.registerCommand('mem:identity', {
-    description: '挂载/卸下 Zero 身份：/mem:identity [on|off] [global]（空参 = 看状态）',
+    description: '挂载/卸下身份：/mem:identity [on|off] [global]（空参 = 看状态）',
     handler: async (args, cmdCtx) => {
       const cfg = await cfgPromise
       const raw = String(args || '').trim().toLowerCase()
       const parts = raw ? raw.split(/\s+/) : []
 
-      const label = (v) => (v === 'on' || v === 'auto' ? '已挂载（Zero）' : '未挂载（普通助手）')
+      const label = (v) => (v === 'on' || v === 'auto' ? '已挂载' : '未挂载')
       const globalVal = cfg.identity === 'on' || cfg.identity === 'auto' ? 'on' : 'off'
       const sessionVal = sessionIdentity === null ? null : sessionIdentity
 
@@ -758,7 +758,7 @@ export default function zeroMemcp(pi) {
             `全局默认: ${label(globalVal)}`,
             '',
             '用法：',
-            '  /mem:identity on          本会话挂载 Zero 身份',
+            '  /mem:identity on          本会话挂载身份',
             '  /mem:identity off         本会话卸下，变回普通助手',
             '  /mem:identity global on   以后新会话默认挂载',
             '  /mem:identity global off  以后新会话默认不挂载',
@@ -809,7 +809,7 @@ export default function zeroMemcp(pi) {
         try {
           const text = await ensureIdentity(cfg, pi)
           if (text) {
-            cmdCtx?.ui?.notify?.('本会话已挂载 Zero 身份，下一轮对话生效', 'info')
+            cmdCtx?.ui?.notify?.('本会话已挂载身份，下一轮对话生效', 'info')
           } else {
             cmdCtx?.ui?.notify?.(
               `挂载失败（拿不到身份块）：${identityError || '服务未返回内容'}。检查 endpoint 与 token。`,
@@ -821,7 +821,7 @@ export default function zeroMemcp(pi) {
         }
       } else {
         cmdCtx?.ui?.notify?.(
-          '本会话已卸下 Zero 身份：不再联想记忆、不再自动落盘。\n' +
+          '本会话已卸下身份：不再联想记忆、不再自动落盘。\n' +
             '已注入的规则块还在系统消息里，压缩后自动消失；想立刻清理请重开会话。',
           'info',
         )
@@ -933,7 +933,7 @@ export default function zeroMemcp(pi) {
           try { wm = await loadWatermark(sessionId) } catch {}
 
           const lines = [
-            `身份: ${active ? '已挂载（Zero）' : '未挂载'}`,
+            `身份: ${active ? '已挂载' : '未挂载'}`,
             `端点: ${cfg.endpoint}`,
             `角色: ${activeRole || '（Token 默认）'}`,
             `落盘: ${mode}${mode === 'auto' ? '（每轮自动）' : ''}`,
@@ -1312,7 +1312,7 @@ export default function zeroMemcp(pi) {
     if (skip) return
     const cfg = await cfgPromise
     if (!cfg.enabled) return
-    // 未挂载 Zero 身份的会话是普通会话：不往提问尾部塞记忆卡片
+    // 未挂载身份的会话是普通会话：不往提问尾部塞记忆卡片
     if (!identityActive(cfg)) return
 
     const text = latestUserText(event.messages)
