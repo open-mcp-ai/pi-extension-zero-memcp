@@ -841,26 +841,28 @@ export default function zeroMemcp(pi) {
   // 插件的职责是「在合适的时机加上下文和写入」，不是替服务端实现记忆。
   pi.registerTool({
     name: "mem",
-    label: "Memory",
+    label: "Context",
     description: [
-      "长期记忆库（zero-memcp）。查过去、架构、主人、踩坑、决定优先用它，不要用 bash 翻磁盘。",
+      "长期上下文（zero-memcp）：跨会话、跨机器的持久上下文。事实、决定、踩坑、偏好都在这里，按需取用。",
+      "",
+      "当前窗口之外的东西不在你的上下文里，但在这里。需要时取，不需要时它不占位。",
       "",
       "  recall <text>            语义搜",
       "  read <addr> [<addr>...]  读全文",
-      "  grep <pattern>           正则精确搜（符号/数字/IP 用它）",
+      "  grep <pattern>           正则精确搜（符号/数字/IP/函数名）",
       "  log [N]                  最近 N 篇",
-      "  ls [date]                列出某天的切片",
+      "  ls [date]                某天的全部切片",
       "  note <kind> -- <text>    写一条（fact/episode/preference/observation）",
-      "  commit [<p>[@<br>]]      封箱（引擎不会自动提交）",
+      "  commit [<p>[@<br>]]      封箱",
       "  diff <p>@<br> [-> <p>@<br>]  分支比对",
       "",
-      "会话管理（插件就地处理）：",
-      "  status                   当前角色、模式、时钟、信箱",
-      "  mode [auto|manual|off]   查看/设置本会话记忆模式",
-      "  role [<name>]            列出/切换本会话身份",
+      "会话（插件就地处理）：",
+      "  status                   身份、角色、落盘模式、时钟、信箱",
+      "  mode [auto|manual|off]   本会话落盘模式",
+      "  role [<name>]            本会话角色",
       "",
-      "不知道用哪个：问「关于X我之前怎么想的」→ recall；",
-      "找精确串 → grep；问「最近做到哪了」→ log。",
+      "落盘规则：auto 模式每轮结束存「提问 + 结论」的问答对（每轮几百字节），",
+      "中间的 toolCall / toolResult / thinking 不单独存。底层是 Git 裸仓库，分支隔离。",
     ].join("\n"),
     parameters: {
       type: "object",
@@ -924,11 +926,19 @@ export default function zeroMemcp(pi) {
             const h = await fetchHealth(cfg, activeProfile)
             clock = typeof h.clock === 'number' ? h.clock : null
           } catch (e) { err = String(e) }
+
+          const mode = sessionImportMode || cfg.importMode
+          const active = identityActive(cfg)
+          let wm = { idx: 0 }
+          try { wm = await loadWatermark(sessionId) } catch {}
+
           const lines = [
+            `身份: ${active ? '已挂载（Zero）' : '未挂载'}`,
             `端点: ${cfg.endpoint}`,
             `角色: ${activeRole || '（Token 默认）'}`,
-            `记忆模式: ${sessionImportMode || cfg.importMode}`,
-            `总线: ${clock === null ? `不可达 (${err})` : clock}`,
+            `落盘: ${mode}${mode === 'auto' ? '（每轮自动）' : ''}`,
+            `本会话: ${wm.idx} 轮已落盘`,
+            `时钟: ${clock === null ? `不可达 (${err})` : clock}`,
             `信箱: ${mailboxUnread} 封未读`,
           ]
           return { content: [{ type: "text", text: lines.join("\n") }] }
