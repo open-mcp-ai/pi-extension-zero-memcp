@@ -718,24 +718,69 @@ export default function zeroMemcp(pi) {
   })
 
   pi.registerCommand('mem:mode', {
-    description: '记录模式：/mem:mode [auto|manual|off]（空参 = 查看当前模式）',
+    description: '记录模式：/mem:mode [auto|manual|off] [global]（空参 = 看状态）',
     handler: async (args, cmdCtx) => {
       const cfg = await cfgPromise
-      const val = String(args || '').trim().toLowerCase()
-      const current = sessionImportMode || cfg.importMode
+      const raw = String(args || '').trim().toLowerCase()
+      const parts = raw ? raw.split(/\s+/) : []
 
-      if (!val) {
-        cmdCtx?.ui?.notify?.(`当前记忆模式: ${current}（全局默认: ${cfg.importMode}）`, 'info')
+      const globalVal = cfg.importMode || 'off'
+      const sessionVal = sessionImportMode
+      const describe = { auto: 'auto（每轮自动）', manual: 'manual（只手动同步）', off: 'off（不记录）' }
+      const show = (v) => describe[v] || v
+
+      // 空参：两条都报，学 /mem:identity 的格式
+      if (!parts.length) {
+        cmdCtx?.ui?.notify?.(
+          [
+            `本会话: ${sessionVal === null ? `跟随全局（${globalVal}）` : `${sessionVal}，全局默认 ${globalVal}`}`,
+            '',
+            '用法：',
+            '  /mem:mode auto            本会话每轮自动存',
+            '  /mem:mode manual          本会话只手动存',
+            '  /mem:mode off             本会话不记录',
+            '  /mem:mode global auto     以后新会话默认 auto',
+            `  /mem:mode global off      以后新会话默认 off`,
+            '',
+            `可选：${show('auto')} / ${show('manual')} / ${show('off')}`,
+          ].join('\n'),
+          'info',
+        )
         return
       }
-      if (!['auto', 'manual', 'off', 'on'].includes(val)) {
-        cmdCtx?.ui?.notify?.('模式仅支持：auto（每轮落盘）、manual（只手动同步）、off（不记录）', 'warning')
+
+      const isGlobal = parts.includes('global')
+      const action = parts.find((x) => ['auto', 'manual', 'off', 'on'].includes(x))
+
+      if (!action) {
+        cmdCtx?.ui?.notify?.('参数只支持 auto / manual / off，可加 global 改全局默认', 'warning')
         return
       }
-      const target = val === 'on' ? 'auto' : val
+      const target = action === 'on' ? 'auto' : action
+
+      if (isGlobal) {
+        try {
+          await saveGlobalConfig({ importMode: target })
+          cfg.importMode = target
+        } catch (err) {
+          cmdCtx?.ui?.notify?.(String(err), 'error')
+          return
+        }
+        // 全局改动同时清掉本会话覆盖，让新设置立刻可见——与 /mem:identity 一致
+        if (sessionImportMode !== null && sessionImportMode !== target) {
+          sessionImportMode = null
+          if (sessionId) await saveSessionSetting(sessionId, { importMode: null })
+        }
+        cmdCtx?.ui?.notify?.(
+          `全局默认已改为: ${show(target)}（对以后新会话生效，本会话${sessionImportMode === null ? '已跟随' : '仍用本会话设置'}）`,
+          'info',
+        )
+        return
+      }
+
       sessionImportMode = target
       if (sessionId) await saveSessionSetting(sessionId, { importMode: target })
-      cmdCtx?.ui?.notify?.(`本会话记忆模式已切换为: ${target}`, 'info')
+      cmdCtx?.ui?.notify?.(`本会话记录模式已设为: ${show(target)}`, 'info')
     },
   })
 
