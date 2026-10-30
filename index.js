@@ -343,7 +343,19 @@ async function saveClock(docs) {
   } catch {}
 }
 
-/** 对问答正文求 SHA256 前 8 位，与服务端写盘的 --hash8 判据保持一致 */
+/**
+ * 对问答正文求 SHA256 前 8 位。
+ *
+ * 这是插件侧的水位指纹，只用来判断「本会话的这一轮写过没有」，
+ * 不发给服务端。
+ *
+ * 曾经这里写着「与服务端写盘的 --hash8 判据保持一致」——那是错的：
+ * 服务端从来没有 --hash8 参数，它的去重靠语义指纹（kind + session
+ * + 正文 的 SHA-256，不含时间戳），与这个 8 位前缀无关。
+ *
+ * 换句话说：插件的水位是性能优化（少发几个请求），
+ * 服务端的判重才是正确性保证。水位丢了只会重发，不会重复落盘。
+ */
 function checksumOf(text) {
   return createHash('sha256').update(text, 'utf8').digest('hex').slice(0, 8)
 }
@@ -462,8 +474,13 @@ async function writeNote(cfg, kind, text, session) {
   const body = String(text || '').trim()
   if (!body) return ''
   const tag = session ? `@${session}` : ''
-  // 落到当前身份的 daily/。activeProfile 为空时走服务端默认。
-  return term(cfg, `note ${kind}${tag} -- ${body}`, 5000, activeProfile)
+
+  // 目标由服务端按 SKILL.md 的 stream: true 决定，插件不硬编码路径。
+  //
+  // 早先这里写死 /daily，那等于把「哪个仓库是流水」这条策略
+  // 塞进客户端——用户改挂载表或重命名项目就要改插件代码。
+  // 现在由项目自己声明归属，客户端只负责说「这是一条流水」。
+  return term(cfg, `note ${kind}${tag} -- ${body}`, 8000, activeProfile)
 }
 
 // 最终回复自动落盘：
@@ -962,7 +979,9 @@ export default function zeroMemcp(pi) {
   // 连接恢复时从那个下标往后扫，写一条推进一次水位。
   //
   // 中途断网：水位停在最后成功的那条，下次连上继续，绝不重复也绝不遗漏。
-  // 就算重放了同一条，服务端靠 hash8 天然 CAS 幂等，返回已有文件。
+  // 就算重放了同一条，服务端也会按语义指纹判重、返回已有路径，
+  // 不会再落一份。水位不是正确性机制——它是「少发几个请求」的优化，
+  // 所以这个文件丢了、两台机器各存一份、或者手动清零，都不会产生重复。
   // liveCtx 只在「调用方手里有新鲜 ctx」时传（工具、命令）。
   // 异步回调一律不传——那时手里的 ctx 可能已经作废了。
   async function syncSessionFromWatermark(cfg, liveCtx) {
