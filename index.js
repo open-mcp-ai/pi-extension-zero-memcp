@@ -938,11 +938,18 @@ export default function zeroMemcp(pi) {
           const docs = health && typeof health.docs_indexed === 'number' ? health.docs_indexed : null
           const reachable = health !== null
 
+          // 会话值与全局默认分开写：只报一个数字的话，用户没法判断
+          // 「这是这场会话的设置，还是以后新会话也会这样」。
+          const globalIdentity = cfg.identity === 'on' || cfg.identity === 'auto' ? 'on' : 'off'
+          const globalMode = cfg.importMode || 'off'
+          const mark = (sessionVal, globalVal) =>
+            sessionVal === null ? `跟随全局（${globalVal}）` : `${sessionVal}，全局默认 ${globalVal}`
+
           const lines = [
-            `身份: ${active ? '已挂载' : '未挂载'}`,
+            `身份: ${mark(sessionIdentity, globalIdentity)}`,
             `端点: ${cfg.endpoint}${reachable ? '' : `（不可达：${err}）`}`,
             `角色: ${activeRole || '（Token 默认）'}`,
-            `落盘: ${mode}${mode === 'auto' ? '（每轮自动）' : ''}`,
+            `落盘: ${mark(sessionImportMode, globalMode)}`,
             `本会话: ${wm.idx} 轮已落盘`,
             docs === null ? null : `mem: ${docs} 篇`,
             `信箱: ${mailboxUnread} 封未读`,
