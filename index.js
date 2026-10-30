@@ -38,6 +38,9 @@ import { createHash } from 'node:crypto'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 
+/** 插件版本号。由 status 命令报出，排查版本时唯一不需要猜的依据。 */
+const VERSION = '0.2.0'
+
 const CONFIG_FILE = process.env.ZERO_MEMCP_CONFIG || join(homedir(), '.zero-memcp', 'config.json')
 
 // 记忆版本号锚点（记录当前感知到的 docs_indexed 总数）
@@ -312,7 +315,10 @@ async function fetchMailbox(cfg, profile = '') {
   const url = profile
     ? `${cfg.endpoint}/mailbox?profile=${encodeURIComponent(profile)}`
     : `${cfg.endpoint}/mailbox`
-  const res = await fetch(url, { signal: AbortSignal.timeout(600) })
+  const res = await fetch(url, {
+    headers: authHeaders(cfg),
+    signal: AbortSignal.timeout(800),
+  })
   if (!res.ok) throw new Error(`mailbox ${res.status}`)
   return await res.json()
 }
@@ -322,7 +328,10 @@ async function fetchHealth(cfg, profile = '') {
   const url = profile
     ? `${cfg.endpoint}/health?profile=${encodeURIComponent(profile)}`
     : `${cfg.endpoint}/health`
-  const res = await fetch(url, { signal: AbortSignal.timeout(600) })
+  const res = await fetch(url, {
+    headers: authHeaders(cfg),
+    signal: AbortSignal.timeout(800),
+  })
   if (!res.ok) throw new Error(`health ${res.status}`)
   return await res.json()
 }
