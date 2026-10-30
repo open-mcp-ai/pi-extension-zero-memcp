@@ -90,6 +90,7 @@ function startSSEListener(pi, getCfg, getProfile, onMailCount) {
       if (!res.ok) throw new Error(`SSE ${res.status}`)
       connected = true
       retryDelay = 1000
+      console.log(`[zero-memcp] SSE 已连接 ${url}`)
 
       const reader = res.body.getReader()
       const decoder = new TextDecoder()
@@ -131,9 +132,17 @@ function startSSEListener(pi, getCfg, getProfile, onMailCount) {
     try { onMailCount && onMailCount(ev) } catch {}
 
     const now = Date.now()
-    if (busy) return
-    if (now - lastWakeAt < 3000) return
+    if (busy) {
+      // 不打断，但要说清楚为什么不打断：排查时最容易误判成「推送没到」。
+      console.log(`[zero-memcp] mail #${ev.seq} 到达，agent 正忙，留给下一轮`)
+      return
+    }
+    if (now - lastWakeAt < 3000) {
+      console.log(`[zero-memcp] mail #${ev.seq} 到达，节流中（${now - lastWakeAt}ms）`)
+      return
+    }
     lastWakeAt = now
+    console.log(`[zero-memcp] mail #${ev.seq} 唤醒 agent`)
     // 唤醒词是固定短语，绝不拼接外部正文——消息内容必须通过
     // MCP 工具读回来，才会落在 tool_result 的沙盒里。
     try {
@@ -189,21 +198,6 @@ async function loadConfig() {
 }
 
 /** 取身份块。失败抛错——这跟联想不一样，缺了就是缺了。 */
-/** 确保服务端有这份身份，没有则从模板创建 */
-async function ensureProfile(cfg, profile) {
-  if (!profile) return null
-  try {
-    const res = await fetch(`${cfg.endpoint}/profiles/${encodeURIComponent(profile)}/ensure`, {
-      method: 'POST',
-      signal: AbortSignal.timeout(5000),
-    })
-    if (!res.ok) return null
-    return await res.json()
-  } catch {
-    return null
-  }
-}
-
 async function fetchIdentity(cfg, profile = '') {
   const url = profile
     ? `${cfg.endpoint}/identity?profile=${encodeURIComponent(profile)}`
@@ -483,8 +477,16 @@ export default function zeroMemcp(pi) {
   // 空串表示让服务端用自己的默认身份。
   let activeProfile = ''
 
-  // 会话上下文引用，供工具里读取整条会话（手动导入用）。
-  let ctxRef = null
+  // 取「本会话消息列表」的闭包。
+  //
+  // 为什么不直接存 ctx：pi 在 newSession / fork / switchSession / reload
+  // 之后会作废旧 ctx，任何在异步回调里继续访问它的代码都会抛
+  // 「This extension ctx is stale」。而 SSE 重连回调可能在几分钟后才跑，
+  // 那时会话早换过不止一次了。
+  //
+  // 所以这里只留一个动作，不留对象：取不到就返回空数组，
+  // 让新会话（session_start 会把它覆盖掉）自己去补。
+  let entriesGetter = null
 
   // 本会话生效的导入模式。默认取全局配置，会话启动时若该会话有
   // 自己的设置就用它覆盖——每条会话互不影响。
@@ -622,11 +624,8 @@ export default function zeroMemcp(pi) {
       if (!cfg.enabled) throw new Error("zero-memcp 已禁用")
       const name = String(params.name || "").trim()
 
-      if (name) {
-        // 先 ensure：不存在的身份会从模板创建（服务端做，插件不碰文件系统）
-        const ensured = await ensureProfile(cfg, name)
-        if (!ensured) throw new Error(`无法创建或确认身份 ${name}（服务可能以单身份模式运行）`)
-      }
+      // 身份即分支：服务端按分支存记忆，新身份不需要预先创建，
+      // 第一次写入时分支自然出现。插件不碰文件系统。
       activeProfile = name
       // 身份块作废，下一轮按新身份取
       identity = ''
@@ -651,7 +650,7 @@ export default function zeroMemcp(pi) {
     async execute() {
       const cfg = await cfgPromise
       if (!cfg.enabled) throw new Error("zero-memcp 已禁用")
-      const n = await syncSessionFromWatermark(ctxRef?.(), cfg)
+      const n = await syncSessionFromWatermark(cfg)
       return {
         content: [{ type: "text", text: n > 0 ? `已写入 ${n} 条` : "没有新的问答对需要写入（全部已存在或为空）" }],
         details: { written: n },
@@ -680,10 +679,10 @@ export default function zeroMemcp(pi) {
         cmdCtx?.ui?.notify?.('zero-memcp 已禁用', 'warning')
         return
       }
-      const sessionCtx = ctxRef?.() ?? cmdCtx
+      // 命令回调手里的 cmdCtx 是新鲜的，优先用它。
       let n = 0
       try {
-        n = await syncSessionFromWatermark(sessionCtx, cfg)
+        n = await syncSessionFromWatermark(cfg, cmdCtx)
       } catch (err) {
         cmdCtx?.ui?.notify?.(`导入失败：${err}`, 'error')
         return
@@ -719,13 +718,6 @@ export default function zeroMemcp(pi) {
       const cfg = await cfgPromise
       if (!cfg.enabled) return
       const name = String(args || '').trim()
-      if (name) {
-        const ensured = await ensureProfile(cfg, name)
-        if (!ensured) {
-          cmdCtx?.ui?.notify?.(`无法创建身份 ${name}`, 'error')
-          return
-        }
-      }
       activeProfile = name
       identity = ''
       identityAt = 0
@@ -837,7 +829,14 @@ export default function zeroMemcp(pi) {
     identityError = null
     resetPerRun()
     seenMemories.clear()
-    ctxRef = () => ctx
+    entriesGetter = () => {
+      try {
+        return ctx?.sessionManager?.getEntries?.() || []
+      } catch {
+        // ctx 已失效（会话被替换/重载）：当作没有消息，不炸。
+        return []
+      }
+    }
 
     if (!skip) {
       const cfgNow = await cfgPromise
@@ -848,14 +847,12 @@ export default function zeroMemcp(pi) {
 
         // 决定本会话身份：优先会话设置，其次全局配置，都没有就走服务端默认
         activeProfile = ss.profile || cfgNow.profile || ''
-        if (activeProfile) {
-          // 如果是新身份，ensure 钩子会自动从模板生成 SKILL.md 等骨架
-          try { await ensureProfile(cfgNow, activeProfile) } catch {}
-        }
+        // 身份即分支：不需要预先创建，首次写入时分支自然出现
 
         // 默认不自动导入：只有这条会话自己开了 auto 才启动同步
         if (cfgNow.syncSessionOnStart && sessionImportMode === 'auto') {
-          try { await syncSessionFromWatermark(ctx, cfgNow) } catch {}
+          // 此刻的 ctx 是新鲜的（就在 session_start 里），可以直接用。
+          try { await syncSessionFromWatermark(cfgNow, ctx) } catch {}
         }
       }
     }
@@ -987,10 +984,16 @@ export default function zeroMemcp(pi) {
   //
   // 中途断网：水位停在最后成功的那条，下次连上继续，绝不重复也绝不遗漏。
   // 就算重放了同一条，服务端靠 hash8 天然 CAS 幂等，返回已有文件。
-  async function syncSessionFromWatermark(ctx, cfg) {
+  // liveCtx 只在「调用方手里有新鲜 ctx」时传（工具、命令）。
+  // 异步回调一律不传——那时手里的 ctx 可能已经作废了。
+  async function syncSessionFromWatermark(cfg, liveCtx) {
     let entries = []
     try {
-      entries = ctx?.sessionManager?.getEntries?.() || []
+      if (liveCtx) {
+        entries = liveCtx?.sessionManager?.getEntries?.() || []
+      } else if (entriesGetter) {
+        entries = entriesGetter()
+      }
     } catch { return 0 }
 
     const wm = await loadWatermark(sessionId)
@@ -1154,7 +1157,7 @@ export default function zeroMemcp(pi) {
       const isBack = lastHealthy === false
       lastHealthy = true
       if (isBack && sessionImportMode === 'auto') {
-        syncSessionFromWatermark(ctxRef?.(), cfg).catch(() => {})
+        syncSessionFromWatermark(cfg).catch(() => {})
       }
 
       if (unread > 0) {

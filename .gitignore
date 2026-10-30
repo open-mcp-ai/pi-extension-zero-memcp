@@ -10,3 +10,6 @@ yarn-error.log*
 
 # Backups
 *.bak*
+
+# Local config (contains endpoint/profile, may be machine-specific)
+config.json

@@ -1,0 +1,9 @@
+{
+  "endpoint": "http://127.0.0.1:1729",
+  "enabled": true,
+  "importMode": "off",
+  "syncSessionOnStart": false,
+  "recallLimit": 3,
+  "recallTimeoutMs": 200,
+  "profile": ""
+}

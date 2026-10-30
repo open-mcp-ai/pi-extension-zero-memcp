@@ -1,6 +1,24 @@
 {
-  "name": "zero-memcp-extension",
-  "private": true,
+  "name": "@open-mcp-ai/pi-extension-zero-memcp",
+  "version": "0.1.0",
+  "description": "Pi agent extension for zero-memcp: identity injection, recall, and automatic memory committing",
   "type": "module",
-  "main": "index.js"
+  "main": "index.js",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/open-mcp-ai/pi-extension-zero-memcp.git"
+  },
+  "keywords": [
+    "pi",
+    "pi-extension",
+    "zero-memcp",
+    "memory",
+    "mcp",
+    "llm"
+  ],
+  "author": "BlackEggAI <blackeggai@users.noreply.github.com>",
+  "license": "MIT",
+  "peerDependencies": {
+    "@mariozechner/pi": ">=0.1.0"
+  }
 }
