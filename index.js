@@ -699,7 +699,7 @@ export default function zeroMemcp(pi) {
   })
 
   pi.registerCommand('mem:sync', {
-    description: '同步到记忆体：把当前会话全部问答导入记忆库（按内容去重）',
+    description: '同步：把当前会话全部问答存入 mem（按内容去重）',
     handler: async (_args, cmdCtx) => {
       const cfg = await cfgPromise
       if (!cfg.enabled) {
@@ -713,12 +713,12 @@ export default function zeroMemcp(pi) {
         cmdCtx?.ui?.notify?.(`同步失败：${err}`, 'error')
         return
       }
-      cmdCtx?.ui?.notify?.(n > 0 ? `已同步 ${n} 条问答到记忆体` : '已是最新，无新内容需要同步', 'info')
+      cmdCtx?.ui?.notify?.(n > 0 ? `已同步 ${n} 条问答到 mem` : '已是最新，无新内容需要同步', 'info')
     },
   })
 
   pi.registerCommand('mem:mode', {
-    description: '记忆模式：/mem:mode [auto|manual|off]（空参 = 查看当前模式）',
+    description: '记录模式：/mem:mode [auto|manual|off]（空参 = 查看当前模式）',
     handler: async (args, cmdCtx) => {
       const cfg = await cfgPromise
       const val = String(args || '').trim().toLowerCase()
@@ -843,7 +843,7 @@ export default function zeroMemcp(pi) {
     name: "mem",
     label: "Context",
     description: [
-      "长期上下文（zero-memcp）：跨会话、跨机器的持久上下文。事实、决定、踩坑、偏好都在这里，按需取用。",
+      "mem —— 跨会话、跨机器的长期上下文。事实、决定、踩坑、偏好都在这里，按需取用。",
       "",
       "当前窗口之外的东西不在你的上下文里，但在这里。需要时取，不需要时它不占位。",
       "",
@@ -944,7 +944,7 @@ export default function zeroMemcp(pi) {
             `角色: ${activeRole || '（Token 默认）'}`,
             `落盘: ${mode}${mode === 'auto' ? '（每轮自动）' : ''}`,
             `本会话: ${wm.idx} 轮已落盘`,
-            docs === null ? null : `长期上下文: ${docs} 篇`,
+            docs === null ? null : `mem: ${docs} 篇`,
             `信箱: ${mailboxUnread} 封未读`,
           ].filter(Boolean)
 
