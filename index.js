@@ -211,6 +211,59 @@ async function loadConfig() {
 let activeRole = ''
 
 /**
+ * 从 JWT 里解出角色清单。
+ *
+ * 为什么在客户端解而不是问服务端：payload 本来就是明文（base64url），
+ * 签名只保证它没被改过，不保证它保密。角色清单是「这张凭证能做什么」
+ * 的自我描述，让用户看见它不需要一次网络往返——而**看得见**很重要：
+ * 一个说不清自己有哪些身份的系统，用户只会一直用最宽的那个。
+ *
+ * 只解码不验签是安全的：这里不做任何授权判断，
+ * 真正的判据永远在服务端。伪造的 payload 只会让它自己看到一份假清单。
+ */
+function rolesOf(token) {
+  if (!token || typeof token !== 'string') return null
+  const parts = token.split('.')
+  if (parts.length !== 3) return null
+  try {
+    let p = parts[1].replace(/-/g, '+').replace(/_/g, '/')
+    while (p.length % 4) p += '='
+    const payload = JSON.parse(Buffer.from(p, 'base64').toString('utf8'))
+    return {
+      subject: payload.sub || '',
+      defaultRole: payload.default || '',
+      roles: payload.roles || {},
+    }
+  } catch {
+    return null
+  }
+}
+
+/**
+ * 把一份角色清单渲染成给人看的多行文本。
+ */
+function renderRoles(info, current) {
+  const names = Object.keys(info.roles || {}).sort()
+  if (!names.length) {
+    return `凭证 ${info.subject} 没有定义角色（单身份模式）`
+  }
+  const lines = [`凭证主体: ${info.subject}`]
+  if (info.defaultRole) lines.push(`默认角色: ${info.defaultRole}（未指定时会用它）`)
+  lines.push('', `角色清单（共 ${names.length} 个）:`)
+  for (const name of names) {
+    const r = info.roles[name] || {}
+    const mark = name === current ? ' ← 当前会话' : ''
+    lines.push(`  ${name}${mark}`)
+    if (r.cap) lines.push(`    能力: ${r.cap}`)
+    for (const m of r.mount || []) {
+      const br = m.branch === '*' ? '所有分支' : m.branch
+      lines.push(`    ${(m.at || '/').padEnd(14)} → ${m.project} @ ${br}  [${m.cap || '-'}]`)
+    }
+  }
+  return lines.join('\n')
+}
+
+/**
  * 构造请求头：带角色与可选凭证。
  *
  * 角色只从这里出去，绝不作为 DSL 参数——参数是模型能碰的地方，
@@ -740,13 +793,36 @@ export default function zeroMemcp(pi) {
 
   // 切换身份的快捷命令
   pi.registerCommand('mem:role', {
-    description: '切换本会话角色：/mem:role <zero|chat|dev>（空参 = 查看当前角色）',
+    description: '切换本会话角色：/mem:role <name>（空参 = 列出全部可用角色）',
     handler: async (args, cmdCtx) => {
+      const cfg = await cfgPromise
       const role = String(args || '').trim()
+
+      // 空参 = 列出清单。清单来自凭证自己，不需要问服务端。
       if (!role) {
-        cmdCtx?.ui?.notify?.(`当前角色: ${activeRole || 'default (chat)'}`, 'info')
+        const info = rolesOf(cfg.token)
+        if (!info) {
+          cmdCtx?.ui?.notify?.('没有凭证或凭证不是 JWT，无法列出角色', 'warning')
+          return
+        }
+        const text = renderRoles(info, activeRole)
+        // notify 一行放不下，清单走日志/消息区
+        if (cmdCtx?.ui?.message) cmdCtx.ui.message(text)
+        else cmdCtx?.ui?.notify?.(text, 'info')
         return
       }
+
+      // 校验角色确实存在：写错名字当场报错，而不是等第一次写记忆时
+      // 才收到一个「未知角色」的 403——那时用户已经在做别的事了。
+      const info = rolesOf(cfg.token)
+      if (info && Object.keys(info.roles).length > 0) {
+        if (!info.roles[role]) {
+          const avail = Object.keys(info.roles).sort().join(', ')
+          cmdCtx?.ui?.notify?.(`没有 "${role}" 这个角色。可用：${avail}`, 'error')
+          return
+        }
+      }
+
       activeRole = role
       if (sessionId) {
         await saveSessionSetting(sessionId, { role })

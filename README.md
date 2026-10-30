@@ -53,7 +53,8 @@ ln -s /path/to/pi-extension-zero-memcp ~/.pi/agent/extensions/zero-memcp
 - `/mem:import` — 手动把当前会话全部问答导入记忆库（按内容 checksum CAS 幂等）；
 - `/mem:auto on|off` — 仅为当前会话开启或关闭每轮自动记忆（不影响其他会话）；
 - `/mem:profile <name>` — 切换记忆身份（分支名，空参 = 默认身份）；
-- `/mem:role <zero|chat|dev>` — 切换并锁定本会话角色（空参 = 查看当前角色，写入本会话元数据）。
+- `/mem:role` — **列出凭证里的全部角色**（名称、能力、挂载表），当前角色带标记；
+- `/mem:role <name>` — 切换并锁定本会话角色（写入本会话元数据，重启后自动恢复）。
 
 ---
 
