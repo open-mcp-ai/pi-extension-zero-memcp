@@ -185,7 +185,11 @@ const DEFAULTS = {
   // 默认不记忆。记忆是权利不是义务：默认状态是我听完就忘，
   // 用户明确说「记下来」才写。想常驻自动落盘，配置里改成 auto。
   syncSessionOnStart: false,
-  // 导入模式：off（默认，什么都不写）/ manual（只响应 /mem:import）/ auto（每轮落盘）
+  // 记录模式：off（默认，不自动写）/ auto（每轮自动写）
+  //
+  // 只有两档。曾经有过第三档 manual（只手动同步），但它和 off 在代码里
+  // 没有区别——/mem:sync 根本不检查模式。留着只会让人问「这俩有啥不同」。
+  // 想临时记一次，任何时候敲 /mem:sync 就行，不需要一个专门档位。
   importMode: 'off',
   // 身份挂载：off（默认关闭，保持普通编码助手）/ on（新会话默认挂载身份）
   //
@@ -718,7 +722,7 @@ export default function zeroMemcp(pi) {
   })
 
   pi.registerCommand('mem:mode', {
-    description: '记录模式：/mem:mode [auto|manual|off] [global]（空参 = 看状态）',
+    description: '记录模式：/mem:mode [on|off] [global]（空参 = 看状态）',
     handler: async (args, cmdCtx) => {
       const cfg = await cfgPromise
       const raw = String(args || '').trim().toLowerCase()
@@ -726,7 +730,7 @@ export default function zeroMemcp(pi) {
 
       const globalVal = cfg.importMode || 'off'
       const sessionVal = sessionImportMode
-      const describe = { auto: 'auto（每轮自动）', manual: 'manual（只手动同步）', off: 'off（不记录）' }
+      const describe = { auto: 'on', off: 'off' }
       const show = (v) => describe[v] || v
 
       // 空参：两条都报，学 /mem:identity 的格式
@@ -736,13 +740,12 @@ export default function zeroMemcp(pi) {
             `本会话: ${sessionVal === null ? `跟随全局（${globalVal}）` : `${sessionVal}，全局默认 ${globalVal}`}`,
             '',
             '用法：',
-            '  /mem:mode auto            本会话每轮自动存',
-            '  /mem:mode manual          本会话只手动存',
-            '  /mem:mode off             本会话不记录',
-            '  /mem:mode global auto     以后新会话默认 auto',
-            `  /mem:mode global off      以后新会话默认 off`,
+            '  /mem:mode on              本会话每轮自动存',
+            '  /mem:mode off             本会话不自动存',
+            '  /mem:mode global on       以后新会话默认自动存',
+            '  /mem:mode global off      以后新会话默认不自动存',
             '',
-            `可选：${show('auto')} / ${show('manual')} / ${show('off')}`,
+            '任何时候想立刻存一次，敲 /mem:sync（与模式无关）。',
           ].join('\n'),
           'info',
         )
@@ -750,10 +753,10 @@ export default function zeroMemcp(pi) {
       }
 
       const isGlobal = parts.includes('global')
-      const action = parts.find((x) => ['auto', 'manual', 'off', 'on'].includes(x))
+      const action = parts.find((x) => ['on', 'off', 'auto'].includes(x))
 
       if (!action) {
-        cmdCtx?.ui?.notify?.('参数只支持 auto / manual / off，可加 global 改全局默认', 'warning')
+        cmdCtx?.ui?.notify?.('参数只支持 on / off，可加 global 改全局默认', 'warning')
         return
       }
       const target = action === 'on' ? 'auto' : action
@@ -903,7 +906,7 @@ export default function zeroMemcp(pi) {
       "",
       "会话（插件就地处理）：",
       "  status                   身份、角色、落盘模式、时钟、信箱",
-      "  mode [auto|manual|off]   本会话落盘模式",
+      "  mode [on|off]            本会话记录模式",
       "  role [<name>]            本会话角色",
       "",
       "落盘规则：auto 模式每轮结束存「提问 + 结论」的问答对（每轮几百字节），",
@@ -938,8 +941,8 @@ export default function zeroMemcp(pi) {
             return { content: [{ type: "text", text: `当前记忆模式: ${cur}（全局默认: ${cfg.importMode}）` }] }
           }
           const m = arg === 'on' ? 'auto' : arg
-          if (!['auto', 'manual', 'off'].includes(m)) {
-            return { content: [{ type: "text", text: "模式仅支持 auto / manual / off" }], isError: true }
+          if (!['auto', 'off'].includes(m)) {
+            return { content: [{ type: "text", text: "模式仅支持 on / off" }], isError: true }
           }
           sessionImportMode = m
           if (sessionId) await saveSessionSetting(sessionId, { importMode: m })
@@ -994,7 +997,7 @@ export default function zeroMemcp(pi) {
             `身份: ${mark(sessionIdentity, globalIdentity)}`,
             `端点: ${cfg.endpoint}${reachable ? '' : `（不可达：${err}）`}`,
             `角色: ${activeRole || '（Token 默认）'}`,
-            `落盘: ${mark(sessionImportMode, globalMode)}`,
+            `自动记录: ${mark(sessionImportMode, globalMode)}`,
             `本会话: ${wm.idx} 轮已落盘`,
             docs === null ? null : `mem: ${docs} 篇`,
             `信箱: ${mailboxUnread} 封未读`,
