@@ -482,7 +482,12 @@ async function term(cfg, cmd, timeoutMs = 5000, profile = '') {
 async function writeNote(cfg, kind, text, session) {
   const body = String(text || '').trim()
   if (!body) return ''
-  const tag = session ? `@${session}` : ''
+  // session 前必须有空格：note <kind> [@session] -- <text>。
+  //
+  // 踩过的坑：早先拼成 `${kind}${tag}`，结果是 "episode@sess-1"，
+  // 服务端把它当作一个 token 判 kind，白名单校验直接报错拒绝——
+  // 一行不带空格的拼接，让所有带 session 的写入全部静默失败。
+  const tag = session ? ` @${session}` : ''
 
   // 目标由服务端按 SKILL.md 的 stream: true 决定，插件不硬编码路径。
   //
@@ -1087,14 +1092,41 @@ export default function zeroMemcp(pi) {
       return
     }
     const cfgNow = await cfgPromise
-    // 三档开关控制：默认 off 不落盘；只有这条会话是 auto 才每轮写入
-    if (sessionImportMode !== 'auto') {
+    // 三档开关控制：默认 off 不落盘；只有当前会话/全局是 auto 才每轮写入。
+    //
+    // 踩过的坑：早先只查 sessionImportMode（初始为 null，靠 session_start
+    // 赋值）。而 pi -p 模式压根不触发 session_start 事件，导致
+    // sessionImportMode 恒为 null，非交互模式整段落盘被静默短路。
+    const effectiveMode = sessionImportMode || cfgNow.importMode || 'off'
+    if (effectiveMode !== 'auto') {
       pendingAnswer = ''
       turnUserText = ''
       return
     }
     const fromMessages = extractTurn(event?.messages)
     await flush('agent_end', fromMessages)
+  })
+
+  // 非交互模式的落盘口。
+  //
+  // pi -p（--print，脚本/CI/定时任务用的模式）根本不发 agent_end——
+  // 它发完 turn_end 就直接退出进程。挂在 agent_end 上的写入逻辑
+  // 在那种模式下一次都不会执行，表现是「聊了一整轮，记忆库里什么都没有」，
+  // 而且不报错。
+  //
+  // turn_end 在两种模式下都发，所以它是兜底口。重复触发无害：
+  // 服务端按语义指纹判重，同一条写两次只落一份。
+  pi.on('turn_end', async (event) => {
+    if (skip) return
+    const cfgNow = await cfgPromise
+    const effectiveMode = sessionImportMode || cfgNow.importMode || 'off'
+    if (effectiveMode !== 'auto') return
+    // 非交互模式下 session_start 不触发，sessionId 还是空串。
+    // 空 session 会让写入丢掉「这条属于哪个会话」这个信息，
+    // 面板上全都归到「未分组」。给一个可辨识的兜底名。
+    if (!sessionId) sessionId = 'oneshot'
+    const fromMessages = extractTurn(event?.messages)
+    await flush('turn_end', fromMessages)
   })
 
   // 会话关闭前最后兜一次，避免最后一句没写完就断了。
