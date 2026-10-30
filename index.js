@@ -920,11 +920,10 @@ export default function zeroMemcp(pi) {
         }
 
         case 'status': {
-          let clock = null
+          let health = null
           let err = null
           try {
-            const h = await fetchHealth(cfg, activeProfile)
-            clock = typeof h.clock === 'number' ? h.clock : null
+            health = await fetchHealth(cfg, activeProfile)
           } catch (e) { err = String(e) }
 
           const mode = sessionImportMode || cfg.importMode
@@ -932,15 +931,23 @@ export default function zeroMemcp(pi) {
           let wm = { idx: 0 }
           try { wm = await loadWatermark(sessionId) } catch {}
 
+          // 报规模，不报计数器。
+          //
+          // clock 是「有人写过东西」的增量通知，重启归零、读数没有
+          // 稳定含义，对用户是无意义数字。真正有用的是「这里有多少」。
+          const docs = health && typeof health.docs_indexed === 'number' ? health.docs_indexed : null
+          const reachable = health !== null
+
           const lines = [
             `身份: ${active ? '已挂载' : '未挂载'}`,
-            `端点: ${cfg.endpoint}`,
+            `端点: ${cfg.endpoint}${reachable ? '' : `（不可达：${err}）`}`,
             `角色: ${activeRole || '（Token 默认）'}`,
             `落盘: ${mode}${mode === 'auto' ? '（每轮自动）' : ''}`,
             `本会话: ${wm.idx} 轮已落盘`,
-            `时钟: ${clock === null ? `不可达 (${err})` : clock}`,
+            docs === null ? null : `长期上下文: ${docs} 篇`,
             `信箱: ${mailboxUnread} 封未读`,
-          ]
+          ].filter(Boolean)
+
           return { content: [{ type: "text", text: lines.join("\n") }] }
         }
       }
