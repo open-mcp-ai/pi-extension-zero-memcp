@@ -186,6 +186,10 @@ const DEFAULTS = {
   importMode: 'off',
   // 身份名：为空时由服务端取默认身份（不泄露到上下文）
   profile: '',
+  // 角色名：为空时由服务端按 Token 的 default 决定
+  role: '',
+  // 凭证：服务端要求鉴权时必填
+  token: '',
 }
 
 async function loadConfig() {
@@ -197,12 +201,35 @@ async function loadConfig() {
   }
 }
 
+/**
+ * 当前会话锁定的角色名。
+ *
+ * 为什么是模块级变量而不是每次现取：角色在会话开始时定一次，
+ * 之后整个会话都用它。中途能改的话，「我这条记忆是用哪个身份写的」
+ * 就没有确定答案了。
+ */
+let activeRole = ''
+
+/**
+ * 构造请求头：带角色与可选凭证。
+ *
+ * 角色只从这里出去，绝不作为 DSL 参数——参数是模型能碰的地方，
+ * 而角色决定能看见什么，把它做成参数等于把提权写进协议。
+ */
+function authHeaders(cfg, extra = {}) {
+  const h = { ...extra }
+  if (activeRole) h['X-Zero-Role'] = activeRole
+  if (cfg && cfg.token) h.Authorization = `Bearer ${cfg.token}`
+  return h
+}
+
 /** 取身份块。失败抛错——这跟联想不一样，缺了就是缺了。 */
 async function fetchIdentity(cfg, profile = '') {
   const url = profile
     ? `${cfg.endpoint}/identity?profile=${encodeURIComponent(profile)}`
     : `${cfg.endpoint}/identity`
   const res = await fetch(url, {
+    headers: authHeaders(cfg),
     signal: AbortSignal.timeout(3000),
   })
   if (!res.ok) throw new Error(`identity ${res.status}`)
@@ -218,7 +245,7 @@ async function recall(cfg, text) {
     : `${cfg.endpoint}/recall`
   const res = await fetch(url, {
     method: 'POST',
-    headers: { 'content-type': 'application/json' },
+    headers: authHeaders(cfg, { 'content-type': 'application/json' }),
     body: JSON.stringify({ text, limit: cfg.recallLimit }),
     signal: AbortSignal.timeout(cfg.recallTimeoutMs),
   })
@@ -361,7 +388,7 @@ async function term(cfg, cmd, timeoutMs = 5000, profile = '') {
     : `${cfg.endpoint}/mcp`
   const res = await fetch(url, {
     method: 'POST',
-    headers: { 'content-type': 'application/json' },
+    headers: authHeaders(cfg, { 'content-type': 'application/json' }),
     body: JSON.stringify({
       jsonrpc: '2.0',
       id: Date.now(),
@@ -712,6 +739,26 @@ export default function zeroMemcp(pi) {
   })
 
   // 切换身份的快捷命令
+  pi.registerCommand('mem:role', {
+    description: '切换本会话角色：/mem:role <zero|chat|dev>（空参 = 查看当前角色）',
+    handler: async (args, cmdCtx) => {
+      const role = String(args || '').trim()
+      if (!role) {
+        cmdCtx?.ui?.notify?.(`当前角色: ${activeRole || 'default (chat)'}`, 'info')
+        return
+      }
+      activeRole = role
+      if (sessionId) {
+        await saveSessionSetting(sessionId, { role })
+      }
+      // 角色切换影响能看到什么，身份块与联想缓存必须作废
+      identity = ''
+      identityAt = 0
+      identityError = null
+      cmdCtx?.ui?.notify?.(`会话角色已锁定为: ${role}（写入本会话元数据）`, 'info')
+    },
+  })
+
   pi.registerCommand('mem:profile', {
     description: '切换记忆身份：/mem:profile <name>（空参 = 默认身份）',
     handler: async (args, cmdCtx) => {
@@ -847,7 +894,9 @@ export default function zeroMemcp(pi) {
 
         // 决定本会话身份：优先会话设置，其次全局配置，都没有就走服务端默认
         activeProfile = ss.profile || cfgNow.profile || ''
-        // 身份即分支：不需要预先创建，首次写入时分支自然出现
+
+        // 决定本会话角色：优先会话持久化记录，其次全局配置，都没有走 Token 默认
+        activeRole = ss.role || cfgNow.role || ''
 
         // 默认不自动导入：只有这条会话自己开了 auto 才启动同步
         if (cfgNow.syncSessionOnStart && sessionImportMode === 'auto') {
