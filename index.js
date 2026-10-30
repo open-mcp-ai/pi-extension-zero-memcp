@@ -187,6 +187,14 @@ const DEFAULTS = {
   syncSessionOnStart: false,
   // 导入模式：off（默认，什么都不写）/ manual（只响应 /mem:import）/ auto（每轮落盘）
   importMode: 'off',
+  // 身份挂载：off（默认关闭，保持普通编码助手）/ on（新会话默认挂载 Zero 身份）
+  //
+  // 为什么默认关：机器上有很多普通会话，不是每个都属于 Zero。
+  // 默认挂载会把所有对话都当成 Zero 的，既污染上下文也污染记忆库。
+  //
+  // 可以通过 /mem:identity on 随时为本会话挂载，
+  // 也可以通过 /mem:identity global on 开启全局默认。
+  identity: 'off',
   // 身份名：为空时由服务端取默认身份（不泄露到上下文）
   profile: '',
   // 角色名：为空时由服务端按 Token 的 default 决定
@@ -199,8 +207,23 @@ async function loadConfig() {
   try {
     return { ...DEFAULTS, ...JSON.parse(await readFile(CONFIG_FILE, 'utf8')) }
   } catch {
-    // 没有配置文件是正常的；服务连不上不是，那种情况在 identity/recall 里各自处理。
     return { ...DEFAULTS }
+  }
+}
+
+/** 修改并写回全局 config.json */
+async function saveGlobalConfig(patch) {
+  try {
+    let cur = {}
+    try {
+      cur = JSON.parse(await readFile(CONFIG_FILE, 'utf8'))
+    } catch {}
+    const updated = { ...cur, ...patch }
+    await mkdir(join(homedir(), '.zero-memcp'), { recursive: true })
+    await writeFile(CONFIG_FILE, JSON.stringify(updated, null, 2) + String.fromCharCode(10), 'utf8')
+    return updated
+  } catch (err) {
+    throw new Error(`保存全局配置失败: ${err.message}`)
   }
 }
 
@@ -577,6 +600,17 @@ export default function zeroMemcp(pi) {
   // 会话级的开关：子代理整个生命周期都不注入、不联想。
   let skip = false
 
+  // 本条会话的身份挂载状态。null 表示跟随全局 config.identity。
+  // 'on' = 这场对话认领为 Zero（挂载身份、联想记忆、允许落盘）
+  // 'off' = 普通会话（纯净助手，不挂载身份、不联想、不自动落盘）
+  let sessionIdentity = null
+
+  /** 当前会话是否挂载了 Zero 身份。会话级设置优先于全局。 */
+  const identityActive = (cfg) => {
+    const v = sessionIdentity ?? cfg.identity ?? 'off'
+    return v === 'on' || v === 'auto' || v === true
+  }
+
   // 已落盘的记忆（按内容哈希去重），避免同一句被反复写入。
   const seenMemories = new Set()
 
@@ -702,6 +736,96 @@ export default function zeroMemcp(pi) {
       sessionImportMode = target
       if (sessionId) await saveSessionSetting(sessionId, { importMode: target })
       cmdCtx?.ui?.notify?.(`本会话记忆模式已切换为: ${target}`, 'info')
+    },
+  })
+
+  pi.registerCommand('mem:identity', {
+    description: '挂载/卸下 Zero 身份：/mem:identity [on|off] [global]（空参 = 看状态）',
+    handler: async (args, cmdCtx) => {
+      const cfg = await cfgPromise
+      const raw = String(args || '').trim().toLowerCase()
+      const parts = raw ? raw.split(/\s+/) : []
+
+      const label = (v) => (v === 'on' || v === 'auto' ? '已挂载（Zero）' : '未挂载（普通助手）')
+      const globalVal = cfg.identity === 'on' || cfg.identity === 'auto' ? 'on' : 'off'
+      const sessionVal = sessionIdentity === null ? null : sessionIdentity
+
+      // 空参：报状态，顺手说清怎么改
+      if (!parts.length) {
+        cmdCtx?.ui?.notify?.(
+          [
+            `本会话: ${sessionVal === null ? `跟随全局（${label(globalVal)}）` : label(sessionVal)}`,
+            `全局默认: ${label(globalVal)}`,
+            '',
+            '用法：',
+            '  /mem:identity on          本会话挂载 Zero 身份',
+            '  /mem:identity off         本会话卸下，变回普通助手',
+            '  /mem:identity global on   以后新会话默认挂载',
+            '  /mem:identity global off  以后新会话默认不挂载',
+          ].join('\n'),
+          'info',
+        )
+        return
+      }
+
+      const isGlobal = parts.includes('global')
+      const action = parts.find((x) => x === 'on' || x === 'off' || x === 'auto')
+
+      if (!action) {
+        cmdCtx?.ui?.notify?.('参数只支持 on / off，可加 global 改全局默认', 'warning')
+        return
+      }
+      const want = action === 'off' ? 'off' : 'on'
+
+      if (isGlobal) {
+        try {
+          await saveGlobalConfig({ identity: want })
+          cfg.identity = want
+        } catch (err) {
+          cmdCtx?.ui?.notify?.(String(err), 'error')
+          return
+        }
+        // 全局改动同时清掉本会话的覆盖，让新设置立刻可见
+        if (sessionIdentity !== null && sessionIdentity !== want) {
+          sessionIdentity = null
+          if (sessionId) await saveSessionSetting(sessionId, { identity: null })
+        }
+        cmdCtx?.ui?.notify?.(
+          `全局默认已改为: ${label(want)}（对以后新开的会话生效，本会话${sessionIdentity === null ? '已跟随' : '仍用本会话设置'}）`,
+          'info',
+        )
+        return
+      }
+
+      // 本会话
+      sessionIdentity = want
+      if (sessionId) await saveSessionSetting(sessionId, { identity: want })
+
+      if (want === 'on') {
+        // 重取一次：上一次可能是失败的，别让"我已经没有身份了"变成永久状态
+        identity = ''
+        identityAt = 0
+        identityError = null
+        try {
+          const text = await ensureIdentity(cfg, pi)
+          if (text) {
+            cmdCtx?.ui?.notify?.('本会话已挂载 Zero 身份，下一轮对话生效', 'info')
+          } else {
+            cmdCtx?.ui?.notify?.(
+              `挂载失败（拿不到身份块）：${identityError || '服务未返回内容'}。检查 endpoint 与 token。`,
+              'warning',
+            )
+          }
+        } catch (err) {
+          cmdCtx?.ui?.notify?.(`挂载失败: ${err}`, 'error')
+        }
+      } else {
+        cmdCtx?.ui?.notify?.(
+          '本会话已卸下 Zero 身份：不再联想记忆、不再自动落盘。\n' +
+            '已注入的规则块还在系统消息里，压缩后自动消失；想立刻清理请重开会话。',
+          'info',
+        )
+      }
     },
   })
 
@@ -852,6 +976,7 @@ export default function zeroMemcp(pi) {
         // 会话级设置覆盖全局：这条会话记不记，看它自己的文件
         const ss = await loadSessionSetting(sessionId)
         sessionImportMode = ss.importMode || cfgNow.importMode
+        sessionIdentity = ss.identity || null
 
         // 决定本会话身份：优先会话设置，其次全局配置，都没有就走服务端默认
         activeProfile = ss.profile || cfgNow.profile || ''
@@ -1092,6 +1217,12 @@ export default function zeroMemcp(pi) {
       return
     }
     const cfgNow = await cfgPromise
+    // 未挂载身份的会话不落盘
+    if (!identityActive(cfgNow)) {
+      pendingAnswer = ''
+      turnUserText = ''
+      return
+    }
     // 三档开关控制：默认 off 不落盘；只有当前会话/全局是 auto 才每轮写入。
     //
     // 踩过的坑：早先只查 sessionImportMode（初始为 null，靠 session_start
@@ -1119,6 +1250,8 @@ export default function zeroMemcp(pi) {
   pi.on('turn_end', async (event) => {
     if (skip) return
     const cfgNow = await cfgPromise
+    // 未挂载身份的普通会话绝不自动写盘，避免污染记忆库
+    if (!identityActive(cfgNow)) return
     const effectiveMode = sessionImportMode || cfgNow.importMode || 'off'
     if (effectiveMode !== 'auto') return
     // 非交互模式下 session_start 不触发，sessionId 还是空串。
@@ -1142,6 +1275,7 @@ export default function zeroMemcp(pi) {
     if (skip) return
     const cfg = await cfgPromise
     if (!cfg.enabled) return
+    if (!identityActive(cfg)) return
 
     const msgs = event.messages
     const head = msgs[0]
@@ -1168,6 +1302,8 @@ export default function zeroMemcp(pi) {
     if (skip) return
     const cfg = await cfgPromise
     if (!cfg.enabled) return
+    // 未挂载 Zero 身份的会话是普通会话：不往提问尾部塞记忆卡片
+    if (!identityActive(cfg)) return
 
     const text = latestUserText(event.messages)
     const extra = []
