@@ -721,8 +721,8 @@ export default function zeroMemcp(pi) {
     },
   })
 
-  pi.registerCommand('mem:mode', {
-    description: '记录模式：/mem:mode [on|off] [global]（空参 = 看状态）',
+  pi.registerCommand('mem:record', {
+    description: '自动记录：/mem:record [on|off] [global]（空参 = 看状态）',
     handler: async (args, cmdCtx) => {
       const cfg = await cfgPromise
       const raw = String(args || '').trim().toLowerCase()
@@ -740,10 +740,10 @@ export default function zeroMemcp(pi) {
             `本会话: ${sessionVal === null ? `跟随全局（${globalVal}）` : `${sessionVal}，全局默认 ${globalVal}`}`,
             '',
             '用法：',
-            '  /mem:mode on              本会话每轮自动存',
-            '  /mem:mode off             本会话不自动存',
-            '  /mem:mode global on       以后新会话默认自动存',
-            '  /mem:mode global off      以后新会话默认不自动存',
+            '  /mem:record on            本会话每轮自动存',
+            '  /mem:record off           本会话不自动存',
+            '  /mem:record global on     以后新会话默认自动存',
+            '  /mem:record global off    以后新会话默认不自动存',
             '',
             '任何时候想立刻存一次，敲 /mem:sync（与模式无关）。',
           ].join('\n'),
@@ -906,7 +906,7 @@ export default function zeroMemcp(pi) {
       "",
       "会话（插件就地处理）：",
       "  status                   身份、角色、落盘模式、时钟、信箱",
-      "  mode [on|off]            本会话记录模式",
+      "  record [on|off]          本会话是否每轮自动存",
       "  role [<name>]            本会话角色",
       "",
       "落盘规则：auto 模式每轮结束存「提问 + 结论」的问答对（每轮几百字节），",
@@ -935,10 +935,10 @@ export default function zeroMemcp(pi) {
 
       // ── 本地动词 ──
       switch (verb) {
-        case 'mode': {
+        case 'record': {
           if (!arg) {
             const cur = sessionImportMode || cfg.importMode
-            return { content: [{ type: "text", text: `当前记忆模式: ${cur}（全局默认: ${cfg.importMode}）` }] }
+            return { content: [{ type: "text", text: `自动记录: ${cur === "auto" ? "on" : cur}（全局默认: ${cfg.importMode === "auto" ? "on" : cfg.importMode}）` }] }
           }
           const m = arg === 'on' ? 'auto' : arg
           if (!['auto', 'off'].includes(m)) {
@@ -946,7 +946,7 @@ export default function zeroMemcp(pi) {
           }
           sessionImportMode = m
           if (sessionId) await saveSessionSetting(sessionId, { importMode: m })
-          return { content: [{ type: "text", text: `本会话记忆模式已设为 ${m}` }] }
+          return { content: [{ type: "text", text: `本会话自动记录已设为: ${m === "auto" ? "on" : m}` }] }
         }
 
         case 'role': {
