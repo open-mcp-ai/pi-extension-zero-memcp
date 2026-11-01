@@ -69,14 +69,17 @@ const WM_DIR = process.env.ZERO_MEMCP_WM_DIR || join(homedir(), '.zero-memcp', '
 //   1. agent 正在思考（busy）时绝不打断，变化留给下一轮 context；
 //   2. 两次唤醒至少间隔 3 秒；
 //   3. 掉线指数退避重连（1s → 2s → … → 30s 封顶）。
-function startSSEListener(pi, getCfg, onTreeEvent) {
+// isBusy 由调用方提供，监听器本身不注册任何 pi 事件。
+//
+// 踩过的坑：这里原本在函数内 pi.on('agent_start'/'agent_end')。
+// 而 restartSSE() 每次换角色都会重新调用本函数，于是每换一次角色
+// 就多注册一对 handler，agent_end 的处理链越攒越长——
+// 表现是同一轮问答被写多遍、以及最后一个 handler 抢走了本该落盘的调用。
+// 注册事件必须只发生一次，所以挪到外面。
+function startSSEListener(pi, getCfg, onTreeEvent, isBusy) {
   let abortCtrl = null
   let retryDelay = 1000
-  let busy = false
   let closed = false
-
-  pi.on('agent_start', () => { busy = true })
-  pi.on('agent_end', () => { busy = false })
 
   async function connect() {
     if (closed) return
@@ -122,7 +125,7 @@ function startSSEListener(pi, getCfg, onTreeEvent) {
             else if (line.startsWith('data: ')) dataStr = line.slice(6).trim()
           }
           if (evName === 'tree' && dataStr) {
-            try { onTreeEvent(JSON.parse(dataStr), busy) } catch {}
+            try { onTreeEvent(JSON.parse(dataStr), isBusy()) } catch {}
           }
         }
       }
@@ -621,6 +624,11 @@ export default function zeroMemcp(pi) {
   let lastWakeAt = 0
   let stopSSE = null
 
+  // agent 是否正在思考。只在这里注册一次，SSE 重启不再重复注册。
+  let agentBusy = false
+  pi.on('agent_start', () => { agentBusy = true })
+  pi.on('agent_end', () => { agentBusy = false })
+
   function restartSSE() {
     if (stopSSE) {
       try { stopSSE() } catch {}
@@ -644,7 +652,7 @@ export default function zeroMemcp(pi) {
       `[zero-memcp] 记忆树更新：${proj}@${br} 推进到 ${commit}` +
         `${brief ? `（${brief}${paths.length > 3 ? ' 等' : ''}）` : ''}`
     )
-    })
+    }, () => agentBusy)
   }
 
   // 锚定 watch 里声明的树。服务端只把 tree 事件推给锚定过的人。
