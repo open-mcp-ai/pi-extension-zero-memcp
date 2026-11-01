@@ -4,6 +4,9 @@
   "description": "Pi agent extension for zero-memcp: identity injection, recall, and automatic memory committing",
   "type": "module",
   "main": "index.js",
+  "bin": {
+    "zero-memcp-import": "./bin/import-sessions.js"
+  },
   "repository": {
     "type": "git",
     "url": "https://github.com/open-mcp-ai/pi-extension-zero-memcp.git"

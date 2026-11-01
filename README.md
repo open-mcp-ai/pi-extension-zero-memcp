@@ -64,6 +64,28 @@ remind 锚定过的人**——不填 `watch` 就收不到变更通知，而且�
 - `/mem:sync` — **同步到记忆体**：手动把当前会话全部问答导入记忆库（按内容 checksum CAS 幂等，无重复开销）；
 - `/mem:record` — **自动记录**：空参查看状态；`/mem:record [on|off] [global]` 切换本会话或全局默认。
 
+---
+
+## 历史会话导入 CLI (`zero-memcp-import`)
+
+把安装插件之前的旧会话（`~/.pi/agent/sessions/*.jsonl`）批量导入到 zero-memcp 中：
+
+```bash
+# 1. 先统计有哪些可以导入（只读扫描，不写盘）
+npx zero-memcp-import --dry-run
+
+# 2. 导入单个指定的 JSONL 文件
+npx zero-memcp-import ~/.pi/agent/sessions/--Users-me--/2026-08-29T...jsonl
+
+# 3. 导入指定目录且只导入 2026-08-01 之后的会话
+npx zero-memcp-import --since 2026-08-01 ~/.pi/agent/sessions/
+```
+
+- **会话快照归并**：按 session UUID 归并压缩版本，同会话只取最大的最新快照；
+- **智能截断与过渡语过滤**：只取 `stopReason === 'stop'` 的最终结论，排除中间态、用户打断与无意义过渡语；
+- **本地账本幂等**：维护 `~/.zero-memcp/import-state.json`，重跑零网络开销，不重复写入；
+- **纯通用协议交互**：通过 MCP `put` 原语入队，正文走 `vars.TEXT`，分批自动 `commit`，服务端不侵入任何 Pi 专属知识。
+
 ## 暴露给模型的工具（只有一个）
 
 遵循 termcp 规范：**声明面恒定为 1，能力增长在命令空间，不在 `tools/list` 堆工具**。
