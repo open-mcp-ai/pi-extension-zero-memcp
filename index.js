@@ -72,7 +72,7 @@ const WM_DIR = process.env.ZERO_MEMCP_WM_DIR || join(homedir(), '.zero-memcp', '
 // isBusy 由调用方提供，监听器本身不注册任何 pi 事件。
 //
 // 踩过的坑：这里原本在函数内 pi.on('agent_start'/'agent_end')。
-// 而 restartSSE() 每次换角色都会重新调用本函数，于是每换一次角色
+// 而 restartSSE() 每次换身份都会重新调用本函数，于是每换一次身份
 // 就多注册一对 handler，agent_end 的处理链越攒越长——
 // 表现是同一轮问答被写多遍、以及最后一个 handler 抢走了本该落盘的调用。
 // 注册事件必须只发生一次，所以挪到外面。
@@ -185,15 +185,21 @@ const DEFAULTS = {
   // 可以通过 /mem:identity on 随时为本会话挂载，
   // 也可以通过 /mem:identity global on 开启全局默认。
   identity: 'off',
-  // 角色名：为空时由服务端按 Token 的 default 决定。
+  // 身份（凭证名）：指向 tokens 表里的哪一张凭证。
   //
-  // 身份视角由凭证的挂载表 + X-Zero-Role 决定，不存在 profile 参数：
-  // 服务端 /identity 已明确删掉 ?profile=（它曾经是个假参数，
-  // 算出来的值赋给一个再也没被读过的变量）。
-  // 要换视角，换角色，不换参数。
-  role: '',
-  // 凭证：服务端要求鉴权时必填
+  // 身份由凭证决定，不由请求头决定：服务端一张凭证就是一个身份，
+  // 它的能力与挂载范围在签发时定死。想换视角就换一张凭证——
+  // 就像换一个数据库连接，而不是给同一个连接发一个"我现在是谁"的 header。
+  //
+  // 空表示用下面这张默认 token。
+  identityName: '',
+  // 默认凭证：服务端要求鉴权时必填。
   token: '',
+  // 具名凭证表：{ "名字": "JWT" }。
+  //
+  // 一个身份一张凭证。服务端签发时就把能力与挂载范围写死了，
+  // 这里只是把它们收在一处，方便按名字切换。
+  tokens: {},
   // 锚定订阅：逗号分隔的树地址，例如 "daily@zero,notes@zero/team"。
   //
   // 服务端的 tree 事件只推给 remind 锚定过的人（eventAllowed 里
@@ -227,26 +233,34 @@ async function saveGlobalConfig(patch) {
 }
 
 /**
- * 当前会话锁定的角色名。
+ * 当前会话锁定的身份名（对应 tokens 表里的键）。
  *
- * 为什么是模块级变量而不是每次现取：角色在会话开始时定一次，
+ * 为什么是模块级变量而不是每次现取：身份在会话开始时定一次，
  * 之后整个会话都用它。中途能改的话，「我这条记忆是用哪个身份写的」
  * 就没有确定答案了。
  */
-let activeRole = ''
+let activeIdentityName = ''
+
+/** 取当前生效的凭证：具名凭证优先，否则默认凭证。 */
+function tokenOf(cfg) {
+  if (!cfg) return ''
+  const name = activeIdentityName || cfg.identityName || ''
+  if (name && cfg.tokens && cfg.tokens[name]) return cfg.tokens[name]
+  return cfg.token || ''
+}
 
 /**
- * 从 JWT 里解出角色清单。
+ * 从 JWT 里解出这张凭证自述的能力与挂载范围。
  *
  * 为什么在客户端解而不是问服务端：payload 本来就是明文（base64url），
- * 签名只保证它没被改过，不保证它保密。角色清单是「这张凭证能做什么」
- * 的自我描述，让用户看见它不需要一次网络往返——而**看得见**很重要：
- * 一个说不清自己有哪些身份的系统，用户只会一直用最宽的那个。
+ * 签名只保证它没被改过，不保证它保密。它是「这张凭证能做什么」的
+ * 自我描述，让用户看见它不需要一次网络往返——而**看得见**很重要：
+ * 一个说不清自己权限的系统，用户只会一直用最宽的那个。
  *
  * 只解码不验签是安全的：这里不做任何授权判断，
- * 真正的判据永远在服务端。伪造的 payload 只会让它自己看到一份假清单。
+ * 真正的判据永远在服务端。伪造的 payload 只会让它自己看到一份假描述。
  */
-function rolesOf(token) {
+function credentialInfo(token) {
   if (!token || typeof token !== 'string') return null
   const parts = token.split('.')
   if (parts.length !== 3) return null
@@ -256,8 +270,8 @@ function rolesOf(token) {
     const payload = JSON.parse(Buffer.from(p, 'base64').toString('utf8'))
     return {
       subject: payload.sub || '',
-      defaultRole: payload.default || '',
-      roles: payload.roles || {},
+      cap: payload.cap || '',
+      mount: payload.mount || [],
     }
   } catch {
     return null
@@ -265,39 +279,60 @@ function rolesOf(token) {
 }
 
 /**
- * 把一份角色清单渲染成给人看的多行文本。
+ * 把「有哪些身份可用」渲染成给人看的多行文本。
+ *
+ * 身份 = 一张凭证。服务端不接受请求头换身份，
+ * 所以这里列出的是本地配好的凭证，不是某张凭证里的子选项。
  */
-function renderRoles(info, current) {
-  const names = Object.keys(info.roles || {}).sort()
-  if (!names.length) {
-    return `凭证 ${info.subject} 没有定义角色（单身份模式）`
-  }
-  const lines = [`凭证主体: ${info.subject}`]
-  if (info.defaultRole) lines.push(`默认角色: ${info.defaultRole}（未指定时会用它）`)
-  lines.push('', `角色清单（共 ${names.length} 个）:`)
-  for (const name of names) {
-    const r = info.roles[name] || {}
-    const mark = name === current ? ' ← 当前会话' : ''
-    lines.push(`  ${name}${mark}`)
-    if (r.cap) lines.push(`    能力: ${r.cap}`)
-    for (const m of r.mount || []) {
-      const br = m.branch === '*' ? '所有分支' : m.branch
-      lines.push(`    ${(m.at || '/').padEnd(14)} → ${m.project} @ ${br}  [${m.cap || '-'}]`)
+function renderIdentities(cfg, current) {
+  const names = Object.keys(cfg.tokens || {}).sort()
+  const lines = []
+
+  const activeName = current || cfg.identityName || ''
+  const activeTok = tokenOf(cfg)
+  const info = credentialInfo(activeTok)
+
+  lines.push(`当前身份: ${activeName || '（默认凭证）'}`)
+  if (info) {
+    lines.push(`  主体: ${info.subject}`)
+    if (info.cap) lines.push(`  能力: ${info.cap}`)
+    if (info.mount && info.mount.length) {
+      lines.push('  挂载:')
+      for (const m of info.mount) {
+        const br = m.branch === '*' ? '所有分支' : m.branch || '默认分支'
+        lines.push(`    ${(m.at || '/').padEnd(14)} → ${m.project} @ ${br}  [${m.cap || '-'}]`)
+      }
+    } else {
+      lines.push('  挂载: 全命名空间')
     }
+  } else {
+    lines.push('  （没有凭证，或凭证不是 JWT）')
+  }
+
+  if (names.length) {
+    lines.push('', `已配置的具名凭证（共 ${names.length} 个）:`)
+    for (const name of names) {
+      const mark = name === activeName ? ' ← 当前会话' : ''
+      lines.push(`  ${name}${mark}`)
+    }
+    lines.push('', '切换：/mem:identity <name>')
+  } else {
+    lines.push('', '只配了默认凭证。想多身份，在 config.json 的 tokens 里加名字 → JWT。')
   }
   return lines.join('\n')
 }
 
 /**
- * 构造请求头：带角色与可选凭证。
+ * 构造请求头：只带凭证，不带任何身份声明头。
  *
- * 角色只从这里出去，绝不作为 DSL 参数——参数是模型能碰的地方，
- * 而角色决定能看见什么，把它做成参数等于把提权写进协议。
+ * 服务端一张凭证就是一个身份，没有任何 header 能改变它。
+ * 想换视角就换凭证（/mem:identity <name>），而不是在同一张凭证上
+ * 声明"我现在是谁"——那种设计把提权入口交给了任何能发 header 的东西。
  */
 function authHeaders(cfg, extra = {}) {
   const h = { ...extra }
-  if (activeRole) h['X-Zero-Role'] = activeRole
-  if (cfg && cfg.token) h.Authorization = `Bearer ${cfg.token}`
+  const tok = tokenOf(cfg)
+  if (tok) h.Authorization = `Bearer ${tok}`
   return h
 }
 
@@ -448,8 +483,7 @@ function isSubagent(ctx) {
 /**
  * 调 zero-memcp 的 term 入口。唯一工具名为 term，正文通过 vars/args 传递。
  *
- * 服务端的 /mcp 接口不接受 profile 参数；权限与视角来自 Bearer Token
- * 和 X-Zero-Role。
+ * 服务端的 /mcp 接口不接受 profile 参数；权限与视角完全来自 Bearer Token。
  */
 async function term(cfg, cmd, timeoutMs = 5000, vars = {}, args = []) {
   const rpcArgs = { cmd }
@@ -596,7 +630,7 @@ export default function zeroMemcp(pi) {
   async function ensureIdentity(cfg, piApi) {
     if (identity || identityError) return identity
     try {
-      // 身份视角由凭证挂载表 + X-Zero-Role 决定，请求里不带 profile。
+      // 身份视角完全由凭证决定：换身份是换一张凭证，不是换一个请求头。
       identity = await fetchIdentity(cfg)
       identityAt = Date.now()
     } catch (err) {
@@ -618,9 +652,8 @@ export default function zeroMemcp(pi) {
   // 注意这里是唯一的启动点：只定义不调用等于"写了监听器但没接上"，
   // 而那种故障不报错，只是永远收不到推送。
   //
-  // 它必须能在角色变化后重启：SSE 连接的身份是建立时那一刻的
-  // （Authorization + X-Zero-Role 都写在请求头里），换角色不重连
-  // 就等于用旧身份继续收推送。
+  // 它必须能在身份变化后重启：SSE 连接的身份是建立时那一刻的凭证，
+  // 切换凭证后不重连就等于用旧身份继续收推送。
   let lastWakeAt = 0
   let stopSSE = null
 
@@ -675,42 +708,6 @@ export default function zeroMemcp(pi) {
   //
   // 只有一个，动词在 cmd 里——和 zero-memcp 的 term 协议同构。
   // ── 用户斜杠命令 ──────────────────────────────────────────
-
-  pi.registerCommand('mem:role', {
-    description: '身份：/mem:role <name>（空参 = 列出全部可用角色）',
-    handler: async (args, cmdCtx) => {
-      const cfg = await cfgPromise
-      const role = String(args || '').trim()
-
-      if (!role) {
-        const info = rolesOf(cfg.token)
-        if (!info) {
-          cmdCtx?.ui?.notify?.('没有凭证或凭证不是 JWT，无法列出角色', 'warning')
-          return
-        }
-        const text = renderRoles(info, activeRole)
-        if (cmdCtx?.ui?.message) cmdCtx.ui.message(text)
-        else cmdCtx?.ui?.notify?.(text, 'info')
-        return
-      }
-
-      const info = rolesOf(cfg.token)
-      if (info && Object.keys(info.roles).length > 0 && !info.roles[role]) {
-        const avail = Object.keys(info.roles).sort().join(', ')
-        cmdCtx?.ui?.notify?.(`没有 "${role}" 这个角色。可用：${avail}`, 'error')
-        return
-      }
-
-      activeRole = role
-      if (sessionId) await saveSessionSetting(sessionId, { role })
-      identity = ''
-      identityAt = 0
-      identityError = null
-      restartSSE()
-      anchorWatchedTrees(cfg).catch(() => {})
-      cmdCtx?.ui?.notify?.(`会话角色已锁定为: ${role}`, 'info')
-    },
-  })
 
   pi.registerCommand('mem:sync', {
     description: '同步：把当前会话全部问答存入 mem（按内容去重）',
@@ -808,29 +805,58 @@ export default function zeroMemcp(pi) {
       const globalVal = cfg.identity === 'on' || cfg.identity === 'auto' ? 'on' : 'off'
       const sessionVal = sessionIdentity === null ? null : sessionIdentity
 
-      // 空参：报状态，顺手说清怎么改
+      // 空参：报状态 + 列出可用凭证 + 说清怎么改
       if (!parts.length) {
-        cmdCtx?.ui?.notify?.(
-          [
-            `本会话: ${sessionVal === null ? `跟随全局（${label(globalVal)}）` : label(sessionVal)}`,
-            `全局默认: ${label(globalVal)}`,
-            '',
-            '用法：',
-            '  /mem:identity on          本会话挂载身份',
-            '  /mem:identity off         本会话卸下，变回普通助手',
-            '  /mem:identity global on   以后新会话默认挂载',
-            '  /mem:identity global off  以后新会话默认不挂载',
-          ].join('\n'),
-          'info',
-        )
+        const head = [
+          `本会话: ${sessionVal === null ? `跟随全局（${label(globalVal)}）` : label(sessionVal)}`,
+          `全局默认: ${label(globalVal)}`,
+          '',
+        ].join('\n')
+        const body = renderIdentities(cfg, activeIdentityName)
+        const tail = [
+          '',
+          '用法：',
+          '  /mem:identity <name>      切换到某张具名凭证（= 换一个身份）',
+          '  /mem:identity on          本会话挂载身份',
+          '  /mem:identity off         本会话卸下，变回普通助手',
+          '  /mem:identity global on   以后新会话默认挂载',
+          '  /mem:identity global off  以后新会话默认不挂载',
+        ].join('\n')
+        cmdCtx?.ui?.notify?.([head, body, tail].join('\n'), 'info')
         return
       }
 
       const isGlobal = parts.includes('global')
       const action = parts.find((x) => x === 'on' || x === 'off' || x === 'auto')
 
+      // 不是 on/off/global 时，把它当作凭证名：切换身份。
+      if (!action && !isGlobal) {
+        const name = parts[0]
+        const tokens = cfg.tokens || {}
+        if (!tokens[name]) {
+          const avail = Object.keys(tokens).sort().join(', ')
+          cmdCtx?.ui?.notify?.(
+            avail
+              ? `没有 "${name}" 这张凭证。可用：${avail}`
+              : `没有 "${name}" 这张凭证。config.json 里还没有配 tokens。`,
+            'error',
+          )
+          return
+        }
+        activeIdentityName = name
+        if (sessionId) await saveSessionSetting(sessionId, { identityName: name })
+        // 换了凭证就是换了一个世界：身份块、SSE 订阅、锚定全部重来。
+        identity = ''
+        identityAt = 0
+        identityError = null
+        restartSSE()
+        anchorWatchedTrees(cfg).catch(() => {})
+        cmdCtx?.ui?.notify?.(`本会话身份已切换为: ${name}（下一轮对话生效）`, 'info')
+        return
+      }
+
       if (!action) {
-        cmdCtx?.ui?.notify?.('参数只支持 on / off，可加 global 改全局默认', 'warning')
+        cmdCtx?.ui?.notify?.('参数支持 <name> / on / off，可加 global 改全局默认', 'warning')
         return
       }
       const want = action === 'off' ? 'off' : 'on'
@@ -891,11 +917,11 @@ export default function zeroMemcp(pi) {
   //
   // 声明面恒定为 1，能力增长在命令空间，不在 tools/list。
   //
-  // 五个工具（zero_mem / _set_mode / _set_profile / _import / _status）
+  // 五个工具（zero_mem / _set_mode / _set_identity / _import / _status）
   // 拆开注册的代价是每轮都多几百字符的 schema，而模型真正需要的只是
   // 「说一句话就能查/写/查状态」。把动词做成参数，schema 只写一次。
   //
-  // 本地动词（mode/sync/status/role）由插件处理，其余整行透传服务端——
+  // 本地动词（mode/sync/status/identity）由插件处理，其余整行透传服务端——
   // 插件的职责是「在合适的时机加上下文和写入」，不是替服务端实现记忆。
   pi.registerTool({
     name: "mem",
@@ -919,9 +945,9 @@ export default function zeroMemcp(pi) {
       "  diff <p>@<br>            分支比对",
       "",
       "会话（插件就地处理）：",
-      "  status                   身份、角色、自动记录与索引规模",
+      "  status                   当前凭证、身份、自动记录与索引规模",
       "  record [on|off]          本会话是否每轮自动存",
-      "  role [<name>]            本会话角色",
+      "  identity [<name>]        查看身份或换一张凭证",
       "",
       "put 入脏层后立即返回；折叠为 Git 提交由显式 commit 或服务端后台策略决定。",
       "正文必须通过 vars/args 传递，例如 cmd='put notes -- $TEXT', vars={TEXT:'正文'}。",
@@ -973,22 +999,29 @@ export default function zeroMemcp(pi) {
           return { content: [{ type: "text", text: `本会话自动记录已设为: ${m === "auto" ? "on" : m}` }] }
         }
 
-        case 'role': {
-          const info = rolesOf(cfg.token)
+        case 'identity': {
           if (!arg) {
-            if (!info) return { content: [{ type: "text", text: '凭证里没有角色信息' }] }
-            return { content: [{ type: "text", text: renderRoles(info, activeRole) }] }
+            return { content: [{ type: "text", text: renderIdentities(cfg, activeIdentityName) }] }
           }
-          if (info && Object.keys(info.roles).length > 0 && !info.roles[arg]) {
-            const avail = Object.keys(info.roles).sort().join(', ')
-            return { content: [{ type: "text", text: `没有 "${arg}" 这个角色。可用：${avail}` }], isError: true }
+          const tokens = cfg.tokens || {}
+          if (!tokens[arg]) {
+            const avail = Object.keys(tokens).sort().join(', ')
+            return {
+              content: [{
+                type: "text",
+                text: avail
+                  ? `没有 "${arg}" 这张凭证。可用：${avail}`
+                  : `没有 "${arg}" 这张凭证。config.json 里还没有配 tokens。`,
+              }],
+              isError: true,
+            }
           }
-          activeRole = arg
-          if (sessionId) await saveSessionSetting(sessionId, { role: arg })
+          activeIdentityName = arg
+          if (sessionId) await saveSessionSetting(sessionId, { identityName: arg })
           identity = ''
           identityAt = 0
           identityError = null
-          return { content: [{ type: "text", text: `会话角色已锁定为 ${arg}` }] }
+          return { content: [{ type: "text", text: `本会话身份已切换为 ${arg}` }] }
         }
 
         case 'status': {
@@ -1016,9 +1049,9 @@ export default function zeroMemcp(pi) {
             sessionVal === null ? `跟随全局（${globalVal}）` : `${sessionVal}，全局默认 ${globalVal}`
 
           const lines = [
-            `身份: ${mark(sessionIdentity, globalIdentity)}`,
+            `凭证: ${activeIdentityName || cfg.identityName || '（默认凭证）'}`,
             `端点: ${cfg.endpoint}${reachable ? '' : `（不可达：${err}）`}`,
-            `角色: ${activeRole || '（Token 默认）'}`,
+            `记忆挂载: ${mark(sessionIdentity, globalIdentity)}`,
             `自动记录: ${mark(sessionImportMode, globalMode)}`,
             `本会话: ${wm.idx} 轮已入库`,
             docs === null ? null : `已索引切片: ${docs} 篇`,
@@ -1071,10 +1104,10 @@ export default function zeroMemcp(pi) {
         sessionImportMode = ss.importMode || cfgNow.importMode
         sessionIdentity = ss.identity || null
 
-        // 决定本会话角色：优先会话持久化记录，其次全局配置，都没有走 Token 默认
-        activeRole = ss.role || cfgNow.role || ''
+        // 决定本会话身份：优先会话持久化记录，其次全局配置，都没有就用默认凭证
+        activeIdentityName = ss.identityName || cfgNow.identityName || ''
 
-        // 角色确定后启动 SSE 连接，并把 watch 声明的树锚定到服务端
+        // 身份确定后启动 SSE 连接，并把 watch 声明的树锚定到服务端
         restartSSE()
         anchorWatchedTrees(cfgNow).catch(() => {})
 

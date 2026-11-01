@@ -32,8 +32,8 @@ ln -s /path/to/pi-extension-zero-memcp ~/.pi/agent/extensions/zero-memcp
 3. 本扩展目录下的 `config.json`；
 4. 默认值：`http://127.0.0.1:1729`，`importMode: "off"`。
 
-身份和授权只由 Bearer Token 与 `X-Zero-Role` 决定，不配置 `profile`；
-旧配置里的 `profile` 字段会被忽略。
+身份和授权完全由 Bearer Token 决定，不存在可逐请求切换身份的 header。
+一张凭证代表一个身份，服务端在签发时将能力与挂载范围定死；需要另一种视角就使用另一张凭证。
 
 创建 `~/.zero-memcp/config.json`：
 
@@ -43,8 +43,9 @@ ln -s /path/to/pi-extension-zero-memcp ~/.pi/agent/extensions/zero-memcp
   "enabled": true,
   "importMode": "off",
   "identity": "off",
-  "role": "",
+  "identityName": "",
   "token": "",
+  "tokens": {},
   "watch": "daily@zero,notes@zero/team",
   "recallLimit": 3,
   "recallTimeoutMs": 200
@@ -60,7 +61,7 @@ remind 锚定过的人**——不填 `watch` 就收不到变更通知，而且�
 
 用户在 TUI 输入框中可使用的 3 个斜杠命令：
 
-- `/mem:role` — **身份**：空参列出凭证内全部可用角色（名称、能力位、挂载表，当前角色带标记）；`/mem:role <name>` 切换并锁定本会话角色（写入会话元数据，重启后自动恢复）；
+- `/mem:identity` — **身份 / 挂载**：空参显示当前身份、凭证能力与挂载范围；`/mem:identity <name>` 切换到一张已配置的凭证（等同换一个数据库连接），当前会话立即使用它；`on|off [global]` 控制本会话或全局默认是否启用记忆注入。
 - `/mem:sync` — **同步到记忆体**：手动把当前会话全部问答导入记忆库（按内容 checksum CAS 幂等，无重复开销）；
 - `/mem:record` — **自动记录**：空参查看状态；`/mem:record [on|off] [global]` 切换本会话或全局默认。
 
@@ -100,9 +101,9 @@ mem({ cmd: "recall 数据库选型" })
 
 | 类别 | 动词 | 说明 |
 |---|---|---|
-| **会话管理**（插件处理） | `mem status` | 当前端点、角色、自动记录模式、本会话已入库轮次与索引规模 |
+| **会话管理**（插件处理） | `mem status` | 当前端点、身份、自动记录模式、本会话已入库轮次与索引规模 |
 | | `mem record [on\|off]` | 模型自主调整本会话自动记录 |
-| | `mem role [<name>]` | 查看/切换本会话角色 |
+| | `mem identity [<name>]` | 查看身份信息或选择另一张凭证 |
 
 > **整场会话同步不在工具里暴露。** 只有 `/mem:sync` 这一个入口，
 > 因为全量写入是重度且难以撤回的操作（实测 757 条约 176 秒、108 万字符），
@@ -125,7 +126,22 @@ mem({ cmd: "recall 数据库选型" })
 - **`auto`**：每轮问答结束时由扩展调用 `put` 自动记录问答对；
 - `/mem:sync` 可手动把当前会话完整问答导入记忆库（按水位与内容去重）。
 
-树变更通知基于服务端 SSE `tree` 事件，只有先执行 `mem remind <project>@<branch>[/<path>]` 锚定后，才会收到对应变更事件。服务端当前不提供 mailbox，也不使用 `?profile=`。
+在 `~/.zero-memcp/config.json` 中配置多张凭证：
+
+```json
+{
+  "identityName": "reader",
+  "token": "<默认凭证>",
+  "tokens": {
+    "reader": "<只读凭证 JWT>",
+    "writer": "<写入凭证 JWT>"
+  }
+}
+```
+
+`/mem:identity writer` 会让当前 Pi 会话改用 `writer` 这张凭证发出的 Bearer Token；服务端不接收身份切换 header，也不允许在同一凭证上换身份。会话重启后会恢复该会话上次选的凭证名。
+
+树变更通知基于服务端 SSE `tree` 事件，只有先执行 `mem remind <project>@<branch>[/<path>]` 锚定后，才会收到对应变更事件。服务端当前不提供 mailbox，也不使用身份切换 header。
 
 ---
 

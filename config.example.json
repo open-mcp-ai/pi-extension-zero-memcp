@@ -6,7 +6,8 @@
   "recallLimit": 3,
   "recallTimeoutMs": 200,
   "identity": "off",
-  "role": "",
+  "identityName": "",
   "token": "",
+  "tokens": {},
   "watch": ""
 }
