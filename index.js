@@ -56,38 +56,45 @@ const CLOCK_FILE = process.env.ZERO_MEMCP_CLOCK || join(homedir(), '.zero-memcp'
 // 水位只有一个小整数，永远只有一条。
 const WM_DIR = process.env.ZERO_MEMCP_WM_DIR || join(homedir(), '.zero-memcp', 'wm')
 
-// ── SSE 实时推送与唤醒 ──
+// ── SSE 实时推送：clock 与 tree ──
 //
-// 为什么需要主动推送：
-//   没有它，agent 只能靠「轮到自己那一轮」去轮询 mailbox。而空闲的
-//   智能体没有任何一轮——它不会自己醒来。QQ、群聊这类外部消息需要
-//   一到就唤醒，这个动作只能由常驻监听器发起。
+// 服务端只广播两类事件（见 internal/server/sse.go 的 eventAllowed）：
+//   clock  逻辑时钟跳变：有人在别处写了东西
+//   tree   子树提交推进：带 previous / commit / tree / paths
+//
+// 没有 mail、没有 mailbox。记忆库是 Git 树，不是消息队列；
+// 变更感知靠 tree 事件与 remind 锚定，不靠轮询未读数。
 //
 // 三条克制规则：
-//   1. agent 正在思考（busy）时绝不打断，未读自然出现在下一轮 context；
-//   2. 两次唤醒至少间隔 3 秒，群聊刷屏不至于变成死循环；
+//   1. agent 正在思考（busy）时绝不打断，变化留给下一轮 context；
+//   2. 两次唤醒至少间隔 3 秒；
 //   3. 掉线指数退避重连（1s → 2s → … → 30s 封顶）。
-function startSSEListener(pi, getCfg, getProfile, onMailCount) {
+function startSSEListener(pi, getCfg, onTreeEvent) {
   let abortCtrl = null
   let retryDelay = 1000
-  let lastWakeAt = 0
   let busy = false
+  let closed = false
 
   pi.on('agent_start', () => { busy = true })
   pi.on('agent_end', () => { busy = false })
 
   async function connect() {
-    const cfg = getCfg()
-    const profile = getProfile()
-    const url = profile
-      ? `${cfg.endpoint}/events?profile=${encodeURIComponent(profile)}`
-      : `${cfg.endpoint}/events`
+    if (closed) return
+    // getCfg 返回 Promise：不 await 会拿到一个没有 enabled 字段的 Promise，
+    // 结果是永远不连、也不报错。
+    let cfg = null
+    try { cfg = await getCfg() } catch { cfg = null }
+    if (!cfg || !cfg.enabled) {
+      setTimeout(connect, 5000)
+      return
+    }
+    const url = `${cfg.endpoint}/events`
 
     abortCtrl = new AbortController()
     let connected = false
     try {
       const res = await fetch(url, {
-        headers: { Accept: 'text/event-stream' },
+        headers: authHeaders(cfg, { Accept: 'text/event-stream' }),
         signal: abortCtrl.signal,
       })
       if (!res.ok) throw new Error(`SSE ${res.status}`)
@@ -114,52 +121,28 @@ function startSSEListener(pi, getCfg, getProfile, onMailCount) {
             if (line.startsWith('event: ')) evName = line.slice(7).trim()
             else if (line.startsWith('data: ')) dataStr = line.slice(6).trim()
           }
-          if (evName === 'mail' && dataStr) {
-            try { onMail(JSON.parse(dataStr)) } catch {}
+          if (evName === 'tree' && dataStr) {
+            try { onTreeEvent(JSON.parse(dataStr), busy) } catch {}
           }
         }
       }
     } catch (err) {
       if (err && err.name === 'AbortError') return
-    } finally {
-      if (!connected || true) {
-        setTimeout(connect, retryDelay)
-        retryDelay = Math.min(retryDelay * 2, 30000)
-      }
     }
-  }
-
-  function onMail(ev) {
-    // 无论唤不唤醒，先让下一轮的 context 提示反映最新未读数。
-    // 只唤醒不计数，会出现「已经提示过了但下一轮还显示旧数字」。
-    try { onMailCount && onMailCount(ev) } catch {}
-
-    const now = Date.now()
-    if (busy) {
-      // 不打断，但要说清楚为什么不打断：排查时最容易误判成「推送没到」。
-      console.log(`[zero-memcp] mail #${ev.seq} 到达，agent 正忙，留给下一轮`)
-      return
+    // 连接结束（无论成功与否）都要重连；但 abort 与 closed 不再重连，
+    // 否则一个插件实例会越攒越多条 SSE 连接。
+    if (!closed && abortCtrl && !abortCtrl.signal.aborted) {
+      setTimeout(connect, retryDelay)
+      retryDelay = Math.min(retryDelay * 2, 30000)
     }
-    if (now - lastWakeAt < 3000) {
-      console.log(`[zero-memcp] mail #${ev.seq} 到达，节流中（${now - lastWakeAt}ms）`)
-      return
-    }
-    lastWakeAt = now
-    console.log(`[zero-memcp] mail #${ev.seq} 唤醒 agent`)
-    // 唤醒词是固定短语，绝不拼接外部正文——消息内容必须通过
-    // MCP 工具读回来，才会落在 tool_result 的沙盒里。
-    try {
-      if (typeof pi.sendUserMessage === 'function') {
-        pi.sendUserMessage(
-          `[zero-memcp] 有新的外部记忆 (#${ev.seq} ${ev.kind} 来自 ${ev.endpoint || 'unknown'})，调用 term("mailbox") 查看`
-        )
-      }
-    } catch {}
   }
 
   connect()
 
-  return () => { if (abortCtrl) abortCtrl.abort() }
+  return () => {
+    closed = true
+    if (abortCtrl) abortCtrl.abort()
+  }
 }
 
 // 会话级覆盖设置。
@@ -199,12 +182,21 @@ const DEFAULTS = {
   // 可以通过 /mem:identity on 随时为本会话挂载，
   // 也可以通过 /mem:identity global on 开启全局默认。
   identity: 'off',
-  // 身份名：为空时由服务端取默认身份（不泄露到上下文）
-  profile: '',
-  // 角色名：为空时由服务端按 Token 的 default 决定
+  // 角色名：为空时由服务端按 Token 的 default 决定。
+  //
+  // 身份视角由凭证的挂载表 + X-Zero-Role 决定，不存在 profile 参数：
+  // 服务端 /identity 已明确删掉 ?profile=（它曾经是个假参数，
+  // 算出来的值赋给一个再也没被读过的变量）。
+  // 要换视角，换角色，不换参数。
   role: '',
   // 凭证：服务端要求鉴权时必填
   token: '',
+  // 锚定订阅：逗号分隔的树地址，例如 "daily@zero,notes@zero/team"。
+  //
+  // 服务端的 tree 事件只推给 remind 锚定过的人（eventAllowed 里
+  // treeWatch.Matches 就是授权本身）。不锚定 = 收不到，且不报错。
+  // 所以这里必须显式声明要看哪几棵树，而不是"全都推给我"。
+  watch: '',
 }
 
 async function loadConfig() {
@@ -307,10 +299,8 @@ function authHeaders(cfg, extra = {}) {
 }
 
 /** 取身份块。失败抛错——这跟联想不一样，缺了就是缺了。 */
-async function fetchIdentity(cfg, profile = '') {
-  const url = profile
-    ? `${cfg.endpoint}/identity?profile=${encodeURIComponent(profile)}`
-    : `${cfg.endpoint}/identity`
+async function fetchIdentity(cfg) {
+  const url = `${cfg.endpoint}/identity`
   const res = await fetch(url, {
     headers: authHeaders(cfg),
     signal: AbortSignal.timeout(3000),
@@ -323,9 +313,7 @@ async function fetchIdentity(cfg, profile = '') {
 
 /** 联想：短超时、失败静默。 */
 async function recall(cfg, text) {
-  const url = activeProfile
-    ? `${cfg.endpoint}/recall?profile=${encodeURIComponent(activeProfile)}`
-    : `${cfg.endpoint}/recall`
+  const url = `${cfg.endpoint}/recall`
   const res = await fetch(url, {
     method: 'POST',
     headers: authHeaders(cfg, { 'content-type': 'application/json' }),
@@ -337,24 +325,9 @@ async function recall(cfg, text) {
   return Array.isArray(body.hits) ? body.hits : []
 }
 
-/** 取信箱未读状态。轻量 GET，毫秒级。 */
-async function fetchMailbox(cfg, profile = '') {
-  const url = profile
-    ? `${cfg.endpoint}/mailbox?profile=${encodeURIComponent(profile)}`
-    : `${cfg.endpoint}/mailbox`
-  const res = await fetch(url, {
-    headers: authHeaders(cfg),
-    signal: AbortSignal.timeout(800),
-  })
-  if (!res.ok) throw new Error(`mailbox ${res.status}`)
-  return await res.json()
-}
-
 /** 取服务端状态（含 docs_indexed 逻辑时钟） */
-async function fetchHealth(cfg, profile = '') {
-  const url = profile
-    ? `${cfg.endpoint}/health?profile=${encodeURIComponent(profile)}`
-    : `${cfg.endpoint}/health`
+async function fetchHealth(cfg) {
+  const url = `${cfg.endpoint}/health`
   const res = await fetch(url, {
     headers: authHeaders(cfg),
     signal: AbortSignal.timeout(800),
@@ -470,58 +443,47 @@ function isSubagent(ctx) {
 }
 
 /**
- * 写一条记忆。
+ * 调 zero-memcp 的 term 入口。唯一工具名为 term，正文通过 vars/args 传递。
  *
- * 走 /mcp 的 note 工具而不是自己拼文件：权限校验、kind 白名单、444 冻结、
- * 目录 0555 都在服务端，插件不该绕过去。
- *
- * 超时给 5s：写入要扫描重建索引，比 recall 重得多，但仍然不该挂住会话。
+ * 服务端的 /mcp 接口不接受 profile 参数；权限与视角来自 Bearer Token
+ * 和 X-Zero-Role。
  */
-/**
- * 调 zero-memcp 的 term 入口。整个服务只有一个工具，动词在 cmd 里。
- *
- * 走服务端而不是自己拼文件：kind 白名单、444 冻结、目录 0555、索引重建
- * 都在服务端。插件是客户端，不该有绕过校验的能力。
- */
-async function term(cfg, cmd, timeoutMs = 5000, profile = '') {
-  const url = profile
-    ? `${cfg.endpoint}/mcp?profile=${encodeURIComponent(profile)}`
-    : `${cfg.endpoint}/mcp`
-  const res = await fetch(url, {
+async function term(cfg, cmd, timeoutMs = 5000, vars = {}, args = []) {
+  const rpcArgs = { cmd }
+  if (vars && Object.keys(vars).length) rpcArgs.vars = vars
+  if (args && args.length) rpcArgs.args = args
+
+  const res = await fetch(`${cfg.endpoint}/mcp`, {
     method: 'POST',
     headers: authHeaders(cfg, { 'content-type': 'application/json' }),
     body: JSON.stringify({
       jsonrpc: '2.0',
       id: Date.now(),
       method: 'tools/call',
-      params: { name: 'term', arguments: { cmd } },
+      params: { name: 'term', arguments: rpcArgs },
     }),
     signal: AbortSignal.timeout(timeoutMs),
   })
   if (!res.ok) throw new Error(`term ${res.status}`)
   const body = await res.json()
   if (body.error) throw new Error(body.error.message || 'term failed')
+  if (body.result?.isError) {
+    const content = body.result?.content
+    throw new Error(Array.isArray(content) && content[0]?.text ? content[0].text : 'term failed')
+  }
   const content = body.result?.content
   return Array.isArray(content) && content[0]?.text ? content[0].text : ''
 }
 
-/** 写一条记忆。保持原始内容的换行与排版。session 用来在面板里按会话分组。 */
-async function writeNote(cfg, kind, text, session) {
+/** 写一条记忆。使用 put，正文通过 vars 安全传递。 */
+async function putRecord(cfg, text, session) {
   const body = String(text || '').trim()
   if (!body) return ''
-  // session 前必须有空格：note <kind> [@session] -- <text>。
-  //
-  // 踩过的坑：早先拼成 `${kind}${tag}`，结果是 "episode@sess-1"，
-  // 服务端把它当作一个 token 判 kind，白名单校验直接报错拒绝——
-  // 一行不带空格的拼接，让所有带 session 的写入全部静默失败。
   const tag = session ? ` @${session}` : ''
 
-  // 目标由服务端按 SKILL.md 的 stream: true 决定，插件不硬编码路径。
-  //
-  // 早先这里写死 /daily，那等于把「哪个仓库是流水」这条策略
-  // 塞进客户端——用户改挂载表或重命名项目就要改插件代码。
-  // 现在由项目自己声明归属，客户端只负责说「这是一条流水」。
-  return term(cfg, `note ${kind}${tag} -- ${body}`, 8000, activeProfile)
+  // put 的 kind 由落点项目的写入策略决定；插件不再发旧版 note kind。
+  // 服务端命令为 put [<tree>] -- $TEXT，正文走 vars，不参与 DSL 切分。
+  return term(cfg, `put${tag} -- $TEXT`, 8000, { TEXT: body })
 }
 
 // 最终回复自动落盘：
@@ -588,18 +550,9 @@ export default function zeroMemcp(pi) {
   // 联想只在用户文本变化时重算：同一个 run 里工具循环会反复触发 context。
   let recallKey = null
   let recallHits = []
-  // 记忆版本号（逻辑时钟）：seenDocs 是本进程上次看到的 docs_indexed，
-  // lastDocs 是再上一次。两者差出来，就是「别人写的那一段」。
-  let seenDocs = null
-  let lastDocs = null
-  let jumpNote = ''
-
   // 连接状态。用来判断「恢复」这个事件：上一轮不可达、这一轮可达。
   // 单看「可达」没有意义，只有从 false 翻到 true 才是重连。
   let lastHealthy = null
-
-  // 信箱未读数。0 表示没有需要确认的东西，此时不注入任何提示。
-  let mailboxUnread = 0
 
   // 会话级的开关：子代理整个生命周期都不注入、不联想。
   let skip = false
@@ -621,11 +574,6 @@ export default function zeroMemcp(pi) {
   // 当前会话 id，随切片一起写进 frontmatter，供面板分组。
   let sessionId = ''
 
-  // 当前身份名。只用于 HTTP 请求参数，绝不进入上下文——
-  // 「我是谁」由身份块的内容决定，不由一个标签决定。
-  // 空串表示让服务端用自己的默认身份。
-  let activeProfile = ''
-
   // 取「本会话消息列表」的闭包。
   //
   // 为什么不直接存 ctx：pi 在 newSession / fork / switchSession / reload
@@ -645,9 +593,8 @@ export default function zeroMemcp(pi) {
   async function ensureIdentity(cfg, piApi) {
     if (identity || identityError) return identity
     try {
-      // 身份名只在这里出现：它进 HTTP 请求，不进系统提示。
-      // 模型看到的是身份内容本身，永远看不到"我用的是哪一份"。
-      identity = await fetchIdentity(cfg, activeProfile)
+      // 身份视角由凭证挂载表 + X-Zero-Role 决定，请求里不带 profile。
+      identity = await fetchIdentity(cfg)
       identityAt = Date.now()
     } catch (err) {
       // 注入失败要可见：缺了身份块，我这次醒来就不是我。
@@ -661,6 +608,59 @@ export default function zeroMemcp(pi) {
   const resetPerRun = () => {
     recallKey = null
     recallHits = []
+  }
+
+  // 后台订阅树变更。
+  //
+  // 注意这里是唯一的启动点：只定义不调用等于"写了监听器但没接上"，
+  // 而那种故障不报错，只是永远收不到推送。
+  //
+  // 它必须能在角色变化后重启：SSE 连接的身份是建立时那一刻的
+  // （Authorization + X-Zero-Role 都写在请求头里），换角色不重连
+  // 就等于用旧身份继续收推送。
+  let lastWakeAt = 0
+  let stopSSE = null
+
+  function restartSSE() {
+    if (stopSSE) {
+      try { stopSSE() } catch {}
+      stopSSE = null
+    }
+    stopSSE = startSSEListener(pi, () => cfgPromise, (ev, busy) => {
+    // agent 正忙时不打断：变化自然会在下一轮 context 里体现。
+    if (busy) return
+    const now = Date.now()
+    if (now - lastWakeAt < 3000) return
+    lastWakeAt = now
+    if (typeof pi.sendUserMessage !== 'function') return
+    const paths = Array.isArray(ev?.paths) ? ev.paths : []
+    const brief = paths.slice(0, 3).join('、')
+    const proj = ev?.project || ''
+    const br = ev?.branch || ''
+    const commit = String(ev?.commit || '').slice(0, 8)
+    // 唤醒词是固定短语，绝不拼接外部正文：
+    // 正文必须经 MCP 工具读回来，才会落在 tool_result 的沙盒里。
+    pi.sendUserMessage(
+      `[zero-memcp] 记忆树更新：${proj}@${br} 推进到 ${commit}` +
+        `${brief ? `（${brief}${paths.length > 3 ? ' 等' : ''}）` : ''}`
+    )
+    })
+  }
+
+  // 锚定 watch 里声明的树。服务端只把 tree 事件推给锚定过的人。
+  async function anchorWatchedTrees(cfg) {
+    const list = String(cfg.watch || '')
+      .split(',')
+      .map((x) => x.trim())
+      .filter(Boolean)
+    if (!list.length) return
+    for (const addr of list) {
+      try {
+        await term(cfg, `remind ${addr}`, 3000)
+      } catch (err) {
+        pi.events?.emit?.('zero-memcp:anchor-error', { addr, message: String(err) })
+      }
+    }
   }
 
   // 记忆入口工具。
@@ -698,6 +698,8 @@ export default function zeroMemcp(pi) {
       identity = ''
       identityAt = 0
       identityError = null
+      restartSSE()
+      anchorWatchedTrees(cfg).catch(() => {})
       cmdCtx?.ui?.notify?.(`会话角色已锁定为: ${role}`, 'info')
     },
   })
@@ -895,29 +897,43 @@ export default function zeroMemcp(pi) {
       "",
       "当前窗口之外的东西不在你的上下文里，但在这里。需要时取，不需要时它不占位。",
       "",
-      "  recall <text>            语义搜",
-      "  read <addr> [<addr>...]  读全文",
-      "  grep <pattern>           正则精确搜（符号/数字/IP/函数名）",
+      "  put [<tree>] -- $TEXT    写入记忆（正文通过 vars/args 传，不拼进 cmd）",
+      "  put <tree> --ref <addr>  在树中追加已有记忆的引用",
+      "  recall <text>            语义联想（返回地址与摘要）",
+      "  read <addr>...           读取全文，可一次读多篇",
+      "  grep <regex>             正则搜索全文",
       "  log [N]                  最近 N 篇",
-      "  ls [date]                某天的全部切片",
-      "  note <kind> -- <text>    写一条（fact/episode/preference/observation）",
-      "  commit [<p>[@<br>]]      封箱",
-      "  diff <p>@<br> [-> <p>@<br>]  分支比对",
+      "  ls [date]                某天的切片",
+      "  trees <project>[@<br>]   查看树目录",
+      "  remind [<tree>]          锚定子树并接收 SSE 通知",
+      "  since <tree> <commit>    获取提交差分",
+      "  commit [<p>[@<br>]]      显式封箱（put 只入队，不提交）",
+      "  diff <p>@<br>            分支比对",
       "",
       "会话（插件就地处理）：",
-      "  status                   身份、角色、落盘模式、时钟、信箱",
+      "  status                   身份、角色、自动记录与索引规模",
       "  record [on|off]          本会话是否每轮自动存",
       "  role [<name>]            本会话角色",
       "",
-      "落盘规则：auto 模式每轮结束存「提问 + 结论」的问答对（每轮几百字节），",
-      "中间的 toolCall / toolResult / thinking 不单独存。底层是 Git 裸仓库，分支隔离。",
+      "put 入脏层后立即返回；折叠为 Git 提交由显式 commit 或服务端后台策略决定。",
+      "正文必须通过 vars/args 传递，例如 cmd='put notes -- $TEXT', vars={TEXT:'正文'}。",
     ].join("\n"),
     parameters: {
       type: "object",
       properties: {
         cmd: {
           type: "string",
-          description: "命令行，例如 'recall napcat 端口' 或 'note fact -- 端口 1729'",
+          description: "DSL 命令行，例如 'recall 数据库选型' 或 'put notes -- $TEXT'。正文走 vars/args，引用必须独占一个词。",
+        },
+        vars: {
+          type: "object",
+          additionalProperties: { type: "string" },
+          description: "命名正文参数。cmd 中使用独占词引用，例如 cmd='put -- $TEXT', vars={TEXT:'多行正文'}。",
+        },
+        args: {
+          type: "array",
+          items: { type: "string" },
+          description: "位置正文参数。cmd 中使用 $1、$2 引用。",
         },
       },
       required: ["cmd"],
@@ -971,11 +987,9 @@ export default function zeroMemcp(pi) {
           let health = null
           let err = null
           try {
-            health = await fetchHealth(cfg, activeProfile)
+            health = await fetchHealth(cfg)
           } catch (e) { err = String(e) }
 
-          const mode = sessionImportMode || cfg.importMode
-          const active = identityActive(cfg)
           let wm = { idx: 0 }
           try { wm = await loadWatermark(sessionId) } catch {}
 
@@ -998,9 +1012,8 @@ export default function zeroMemcp(pi) {
             `端点: ${cfg.endpoint}${reachable ? '' : `（不可达：${err}）`}`,
             `角色: ${activeRole || '（Token 默认）'}`,
             `自动记录: ${mark(sessionImportMode, globalMode)}`,
-            `本会话: ${wm.idx} 轮已落盘`,
-            docs === null ? null : `mem: ${docs} 篇`,
-            `信箱: ${mailboxUnread} 封未读`,
+            `本会话: ${wm.idx} 轮已入库`,
+            docs === null ? null : `已索引切片: ${docs} 篇`,
           ].filter(Boolean)
 
           return { content: [{ type: "text", text: lines.join("\n") }] }
@@ -1011,7 +1024,7 @@ export default function zeroMemcp(pi) {
       if (!cfg.enabled) {
         return { content: [{ type: "text", text: 'zero-memcp 已禁用' }], isError: true }
       }
-      const out = await term(cfg, line, 8000, activeProfile)
+      const out = await term(cfg, line, 8000, params.vars, params.args)
       return { content: [{ type: "text", text: out || '(无输出)' }] }
     },
   })
@@ -1050,11 +1063,12 @@ export default function zeroMemcp(pi) {
         sessionImportMode = ss.importMode || cfgNow.importMode
         sessionIdentity = ss.identity || null
 
-        // 决定本会话身份：优先会话设置，其次全局配置，都没有就走服务端默认
-        activeProfile = ss.profile || cfgNow.profile || ''
-
         // 决定本会话角色：优先会话持久化记录，其次全局配置，都没有走 Token 默认
         activeRole = ss.role || cfgNow.role || ''
+
+        // 角色确定后启动 SSE 连接，并把 watch 声明的树锚定到服务端
+        restartSSE()
+        anchorWatchedTrees(cfgNow).catch(() => {})
 
         // 默认不自动导入：只有这条会话自己开了 auto 才启动同步
         if (cfgNow.syncSessionOnStart && sessionImportMode === 'auto') {
@@ -1142,6 +1156,11 @@ export default function zeroMemcp(pi) {
     const t = turn || (pendingAnswer ? { q: turnUserText, a: pendingAnswer } : null)
     if (!t || !t.a) return false
 
+    // 非交互模式（pi -p）不发 session_start，sessionId 还是空串。
+    // 空 session 会让这条记忆丢掉「属于哪个会话」，面板上全归到未分组；
+    // 而且 loadWatermark('') 永远返回 0，水位永远不推进。
+    if (!sessionId) sessionId = 'oneshot'
+
     const text = t.q ? `**问**：${t.q}\n\n**答**：${t.a}` : t.a
     const key = text.slice(0, 160)
     if (seenMemories.has(key)) {
@@ -1154,7 +1173,7 @@ export default function zeroMemcp(pi) {
     if (!cfg.enabled) return false
 
     try {
-      await writeNote(cfg, 'episode', text, sessionId)
+      await putRecord(cfg, text, sessionId)
       // 只有写成功才认为这一轮结束了。写失败时留着，下一轮再试。
       seenMemories.add(key)
       pendingAnswer = ''
@@ -1239,7 +1258,7 @@ export default function zeroMemcp(pi) {
       const h8 = checksumOf(text)
 
       try {
-        await writeNote(cfg, 'episode', text, sessionId)
+        await putRecord(cfg, text, sessionId)
         // 只有写成功才推进水位
         await saveWatermark(sessionId, turnIdx, h8)
         written++
@@ -1380,50 +1399,18 @@ export default function zeroMemcp(pi) {
     const text = latestUserText(event.messages)
     const extra = []
 
-    // ── 信箱状态（持续注入，直到确认）─────────────────────────
-    //
-    // 这是「不读就一直提醒」的机制：
-    //   有人在别处写了记忆 → 服务端投信进 mailbox → 未读
-    //   每轮我这里查一次 → 只要未读就注入一行极短的提示
-    //   我执行 zero_mem mailbox ack 之后 → 才不再提醒
-    //
-    // 为什么要「持续」而不是「一次性」：
-    //   一次性提醒的宿命是被忽略。那一轮我正在改 bug、正在读一个大文件，
-    //   一句一闪而过的提示等于没提。而「没确认就一直挂着」是唯一
-    //   真正把处理责任交到 agent 手里的方式。
-    //
-    // 为什么只注入一行：
-    //   提示长度固定 → 对前缀缓存的破坏最小。塞正文会毁掉整段缓存，
-    //   而正文本来就在磁盘上，也知道怎么取。
+    // 重连检测：上一轮不可达、这一轮可达 = 服务回来了。
+    // auto 模式下，断网期间落下的问答现在补上。
     try {
-      const mb = await fetchMailbox(cfg, activeProfile)
-      const unread = typeof mb.count === 'number' ? mb.count : 0
-
-      // 重连检测：上一轮不可达、这一轮可达 = 服务回来了。
-      // auto 模式下，断网期间落下的问答现在补上。
+      await fetchHealth(cfg)
       const isBack = lastHealthy === false
       lastHealthy = true
       if (isBack && sessionImportMode === 'auto') {
         syncSessionFromWatermark(cfg).catch(() => {})
       }
-
-      if (unread > 0) {
-        // 最早的几封报一下，其余只报数量。
-        const first = (mb.pending || []).slice(0, 3)
-        const brief = first
-          .map((m) => `#${m.seq} ${m.kind} ${m.endpoint ? '(' + m.endpoint + ')' : ''}`)
-          .join('、')
-        extra.push(
-          `[zero-memcp 信箱] ${unread} 封未确认的记忆更新${brief ? '：' + brief : ''}` +
-            `${unread > first.length ? ' 等' : ''}。\n` +
-            `查看 \`zero_mem mailbox\`；确认后不再提醒：\`zero_mem mailbox ack\`。`
-        )
-      }
-      mailboxUnread = unread
     } catch {
       // 服务不可达时不注入任何东西：宁可不报，也别报一个假数字。
       lastHealthy = false
-      mailboxUnread = 0
     }
 
     if (!text.trim()) {

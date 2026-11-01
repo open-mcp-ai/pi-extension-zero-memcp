@@ -5,7 +5,8 @@
   "syncSessionOnStart": false,
   "recallLimit": 3,
   "recallTimeoutMs": 200,
-  "profile": "",
+  "identity": "off",
   "role": "",
-  "token": ""
+  "token": "",
+  "watch": ""
 }
