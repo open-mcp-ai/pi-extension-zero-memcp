@@ -446,6 +446,46 @@ async function saveWatermark(sessionId, idx, hash) {
 }
 
 /** 读当前会话的个性化设置（覆盖全局配置） */
+/**
+ * deriveSessionId 从 ExtensionContext 里取出稳定的会话标识。
+ *
+ * Pi 的 ctx 上没有 sessionId 字段，真实位置是 ctx.sessionManager：
+ *   - sessionId      ：字符串，最直接；
+ *   - sessionFile    ：<ISO 时间戳>_<uuid>.jsonl，文件名里带 uuid；
+ *   - getHeader()    ：老版本 API，保留作兼容。
+ *
+ * 三者按可靠性排序，逐个试。全都没有时返回空串——调用方会提示，
+ * 而不是静默把设置写到 `.json` 这种共用文件名上。
+ */
+function deriveSessionId(ctx, isSub) {
+  const sm = ctx?.sessionManager
+  let base = ''
+
+  const direct = typeof sm?.sessionId === 'string' ? sm.sessionId : ''
+  if (direct) {
+    base = direct
+  } else {
+    const headerId = (() => {
+      try {
+        const h = sm?.getHeader?.()
+        return typeof h?.id === 'string' ? h.id : ''
+      } catch {
+        return ''
+      }
+    })()
+    if (headerId) {
+      base = headerId
+    } else if (typeof sm?.sessionFile === 'string' && sm.sessionFile) {
+      // 退路：从文件名里抠 uuid。
+      const m = /([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$/i.exec(sm.sessionFile)
+      if (m) base = m[1]
+    }
+  }
+
+  if (!base) return ''
+  return isSub ? `sub:${base}` : base
+}
+
 async function loadSessionSetting(sessionId) {
   if (!sessionId) return {}
   try {
@@ -887,6 +927,7 @@ export default function zeroMemcp(pi) {
       }
 
       sessionImportMode = target
+      if (!sessionId) sessionId = deriveSessionId(ctx, skip)
       if (sessionId) await saveSessionSetting(sessionId, { importMode: target })
       cmdCtx?.ui?.notify?.(`本会话记录模式已设为: ${show(target)}`, 'info')
     },
@@ -981,6 +1022,7 @@ export default function zeroMemcp(pi) {
 
       // 本会话
       sessionIdentity = want
+      if (!sessionId) sessionId = deriveSessionId(ctx, skip)
       if (sessionId) await saveSessionSetting(sessionId, { identity: want })
 
       if (want === 'on') {
@@ -1172,13 +1214,27 @@ export default function zeroMemcp(pi) {
     cfgPromise = loadConfig()
     skip = isSubagent(ctx)
     // 记下会话 id，落盘时带上，面板才能按会话分组。
+    //
+    // 踩过的坑：这里原先只试 sessionManager.getHeader() 和 getSessionId()。
+    // 这两个方法在 Pi 的 sessionManager 上都不存在（实测字段是
+    // sessionId / sessionFile / sessionDir ...），于是 sessionId 恒为空串。
+    // 连锁后果是静默的、且很难查：
+    //   - saveSessionSetting('') 第一行就 return，/mem:identity on 存不下来；
+    //   - loadSessionSetting('') 返回 {}，sessionIdentity 恒为 null，
+    //     回落成全局 identity=off，于是身份块和召回都不注入；
+    //   - 水位同步同理失效。
+    // 用户看到的现象是「敲了 /mem:identity on，但身份没挂上」，
+    // 而代码里没有任何一处报错。
     try {
-      const header = ctx?.sessionManager?.getHeader?.()
-      const base = header?.id || ctx?.sessionManager?.getSessionId?.() || ''
-      // 子会话打标记：内容保留，来源可辨。
-      sessionId = skip && base ? `sub:${base}` : base
+      sessionId = deriveSessionId(ctx, skip)
     } catch {
       sessionId = skip ? 'sub:unknown' : ''
+    }
+    if (!sessionId) {
+      // 宁可显式说出来，也不要让「每会话设置」静默失效。
+      try {
+        ctx?.ui?.notify?.('zero-memcp: 取不到会话 id，本会话的身份/记录设置不会持久化', 'warning')
+      } catch {}
     }
     identity = ''
     identityAt = 0
