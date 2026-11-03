@@ -7,7 +7,7 @@
 | Pi 钩子 | 触发时机 | 动作 | 容错策略 |
 |---|---|---|---|
 | `context_with_system` | 构造系统提示词 | 将当前身份的规则块（`inject: every_turn`）拼入开头 | **失败显式报错**（身份缺失不能假装正常） |
-| `context` | 每次用户发问前 | 取 2-3 个最相关的记忆地址卡片追加到上下文尾部 | 失败静默（少一次联想不阻断会话） |
+| `context` | 每次用户发问前 | 按优先级分层召回（配置 `recallScopes`），把第一个命中的层连同正文摘要追加到上下文尾部 | 失败静默（少一次联想不阻断会话） |
 | `context` | 每次用户发问前 | 检查服务端可达性，恢复时补发断线期间未入库的问答 | 失败静默 |
 | `agent_end` | 当轮问答结束 | 通过 `put` 将当轮问答对写入脏层（仅在 `auto` 模式） | 幂等写入，防重复 |
 | SSE 监听器 | 后台常驻 | 接收服务端 `tree` 树变更与 `clock` 时钟广播 | 断线指数退避重连 |
@@ -48,12 +48,43 @@ ln -s /path/to/pi-extension-zero-memcp ~/.pi/agent/extensions/zero-memcp
   "tokens": {},
   "watch": "daily@zero,notes@zero/team",
   "recallLimit": 3,
-  "recallTimeoutMs": 200
+  "recallTimeoutMs": 200,
+  "recallScopes": ["zero-agi@fact", "zero-agi@record", "zero-agi@thought"],
+  "recallLayerTimeoutMs": 2000
 }
 ```
 
 `watch` 是 SSE 订阅的树地址（逗号分隔）。服务端的 tree 事件**只推给
 remind 锚定过的人**——不填 `watch` 就收不到变更通知，而且不会报错。
+
+### 分层召回（`recallScopes`）
+
+记忆可以按认知层级分到不同分支，`recallScopes` 决定查询顺序：
+
+```json
+"recallScopes": ["zero-agi@fact", "zero-agi@record", "zero-agi@thought"]
+```
+
+扩展把它编译成一条服务端回落链：
+
+```
+recall $Q --scope zero-agi@fact || recall $Q --scope zero-agi@record || recall $Q --scope zero-agi@thought
+```
+
+`||` 表示「上一层没查到才问下一层」。事实层命中时，后面两层**根本不执行**，
+既省一次检索也省一段本该塞进 prompt 的无关正文。
+
+为什么不用一个 `scope` 查全部：想法层（thinking）的文本量是事实层的十几倍，
+混在一起查时它靠体量就能把提炼过的结论挤出 top-N——于是「有结论」和
+「有过一段推演」在结果里分不出来。层级不是排序偏好，是可信度差异：
+事实层是结论，记录层是当时的原话，想法层是推理过程。注入的文本会标明来源层，
+避免模型把推演当结论用。
+
+留空 `[]` 则退回单次全局检索（返回地址列表，不带正文摘要）。
+
+`recallLayerTimeoutMs` 比 `recallTimeoutMs` 宽松（默认 2000ms）：一次回落链
+最多做三次检索，200ms 会把正常查询误判成超时，而超时是静默丢弃——
+看起来就像「记忆库里没有」。
 
 ---
 

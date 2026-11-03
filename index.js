@@ -165,6 +165,22 @@ const DEFAULTS = {
   endpoint: 'http://127.0.0.1:1729',
   recallTimeoutMs: 200,
   recallLimit: 3,
+  // 分层记忆：按优先级排列的作用域列表，例如
+  //   ["zero-agi@fact", "zero-agi@record", "zero-agi@thought"]
+  //
+  // 为什么是列表而不是一个 scope：记忆有层，层的价值不同。事实层是已经
+  // 提炼过的结论，记录层是发生过什么，想法层是推理过程。一次查询不该
+  // 平等地翻三层——上层有答案时，下层的正文只是噪声，还会把 top-N 名额
+  // 从真正的结论上挤走。
+  //
+  // 顺序就是优先级，用 '||' 连成一条回落链：上层查到了就停，
+  // 查不到才付下一层的代价。空列表表示不分层，走单次全局检索。
+  recallScopes: [],
+  // 分层回落时每层最多取几条。比 recallLimit 略大，因为落空是常态。
+  recallScopeLimit: 3,
+  // 分层回落的总超时。比单次 recall 宽松：一次三层回落最多要做三次
+  // 检索，200ms 会把正常查询误判成超时（超时=静默丢弃，看起来像没记忆）。
+  recallLayerTimeoutMs: 2000,
   enabled: true,
   // 身份块每小时最多重取一次；它们几乎不变，变了也是新会话该看的事。
   identityTtlMs: 60 * 60 * 1000,
@@ -561,6 +577,88 @@ function latestUserText(messages) {
     }
   }
   return ''
+}
+
+/**
+ * 按优先级分层召回：一条 DSL 链，上层查到就停。
+ *
+ * 为什么不是「查三次、拼起来」：那会把想法层的正文也塞进 prompt，
+ * 而想法层是 2695 条推理过程，它靠体量就能把事实层的结论挤出 top-N。
+ * 用 '||' 表达「上一层没答案才问下一层」，服务端执行时短路，
+ * 既省 token 也省检索——层级的语义落在查询语言里，而不是插件里。
+ *
+ * 查询词走 vars，不拼进命令行：正文里可能有分号、换行、'--scope'，
+ * 拼进去就成了语法的一部分。
+ */
+async function recallLayered(cfg, text) {
+  const scopes = Array.isArray(cfg.recallScopes) ? cfg.recallScopes.filter(Boolean) : []
+  if (!scopes.length) return null
+
+  const cmd = scopes
+    .map((sc) => `recall $Q --scope ${sc}`)
+    .join(' || ')
+
+  const out = await term(cfg, cmd, cfg.recallLayerTimeoutMs, { Q: String(text || '').trim() })
+
+  // 输出是一串块，每块形如：
+  //   [statement] recall <query> --scope zero-agi@fact
+  //   <hit list>
+  // 或者 no matches。
+  const sections = String(out || '')
+    .split(/\n\n(?=\[statement\] )/)
+    .map((part) => {
+      const nl = part.indexOf('\n')
+      const head = (nl < 0 ? part : part.slice(0, nl)).trim()
+      const body = (nl < 0 ? '' : part.slice(nl + 1)).trim()
+      const m = /^\[statement\]\s+(.*)$/.exec(head)
+      if (!m) return null
+      return { statement: m[1], body }
+    })
+    .filter(Boolean)
+
+  // 短路链里排在最后的那块就是真正给出答案的层——
+  // 前面的都是 no matches，后面的根本没执行。
+  for (let i = sections.length - 1; i >= 0; i--) {
+    const body = sections[i].body
+    if (!body || body === 'no matches') continue
+    const scope = scopes.find((sc) => sections[i].statement.includes(`--scope ${sc}`)) || scopes[0]
+    const tried = sections.map((sec) => {
+      const sc = scopes.find((x) => sec.statement.includes(`--scope ${x}`)) || ''
+      return { scope: sc, hit: sec.body !== 'no matches' && !!sec.body }
+    })
+    return { scope, body, tried }
+  }
+  return { scope: '', body: '', tried: sections.map((sec) => {
+    const sc = scopes.find((x) => sec.statement.includes(`--scope ${x}`)) || ''
+    return { scope: sc, hit: false }
+  }) }
+}
+
+/**
+ * 渲染分层召回结果。带上「来自哪一层」，因为层的可信度不同：
+ * 事实层是提炼过的结论，记录层是当时说过的话，想法层是推演过程。
+ * 不说清来源，模型会把一段推演当成结论用。
+ */
+function renderLayered(res, cfg) {
+  if (!res || !res.body) {
+    if (!res || !res.tried?.length) return ''
+    const order = res.tried.map((t) => t.scope).filter(Boolean).join(' → ')
+    return [
+      '<recalled_memories>',
+      `分层记忆（${order}）都已查过，没有命中。不要假设这些记忆里存在答案。`,
+      '</recalled_memories>',
+    ].join('\n')
+  }
+  const order = res.tried.map((t) => t.scope).filter(Boolean).join(' → ')
+  return [
+    '<recalled_memories>',
+    `按优先级依次查了：${order}。下面是第一个命中的层（${res.scope}）的原文摘要。`,
+    '事实层是提炼过的结论，记录层是当时的原话，想法层是推理过程——可信度不同，别混用。',
+    '需要完整内容时用 read 展开地址；与本轮无关就忽略。',
+    '',
+    res.body,
+    '</recalled_memories>',
+  ].join('\n')
 }
 
 function renderHits(hits) {
@@ -1463,6 +1561,23 @@ export default function zeroMemcp(pi) {
       return [...event.messages, { role: 'user', content: extra.join('\n\n') }]
     }
     recallKey = text
+
+    // 已配置分层：走一条 '||' 回落链，只把真正答上来的那一层放进上下文。
+    // 没配置分层：保持老的单次全局检索（返回地址列表）。
+    const layered = Array.isArray(cfg.recallScopes) && cfg.recallScopes.length > 0
+
+    if (layered) {
+      try {
+        recallHits = [await recallLayered(cfg, text)]
+      } catch {
+        recallHits = []
+        return extra.length ? [...event.messages, { role: 'user', content: extra.join('\n\n') }] : undefined
+      }
+      const rendered = renderLayered(recallHits[0], cfg)
+      if (rendered) extra.push(rendered)
+      if (!extra.length) return
+      return [...event.messages, { role: 'user', content: extra.join('\n\n') }]
+    }
 
     try {
       recallHits = await recall(cfg, text)
