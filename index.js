@@ -178,6 +178,19 @@ const DEFAULTS = {
   recallScopes: [],
   // 分层回落时每层最多取几条。比 recallLimit 略大，因为落空是常态。
   recallScopeLimit: 3,
+  // 分层落点：不同性质的内容写进不同的分支。
+  //
+  // 为什么写入也要分层：读的时候按可信度分了三层，写的时候却全塞进一个
+  // 平铺目录，那这套分层就只对历史数据成立，新对话立刻退化成一锅粥。
+  // 读取的价值取决于写入时有没有保住「这是结论 / 这是原话 / 这是推演」
+  // 这个区别。
+  //
+  //   recordScope：一问一答（默认落点）
+  //   factScope  ：compaction 摘要——Pi 压缩时产出的提炼结论
+  //
+  // 留空表示不分层，走 put 的默认落点（由服务端的 stream 策略决定）。
+  recordScope: '',
+  factScope: '',
   // 分层回落的总超时。比单次 recall 宽松：一次三层回落最多要做三次
   // 检索，200ms 会把正常查询误判成超时（超时=静默丢弃，看起来像没记忆）。
   recallLayerTimeoutMs: 2000,
@@ -569,14 +582,31 @@ async function term(cfg, cmd, timeoutMs = 5000, vars = {}, args = []) {
 }
 
 /** 写一条记忆。使用 put，正文通过 vars 安全传递。 */
-async function putRecord(cfg, text, session) {
+async function putRecord(cfg, text, session, target) {
   const body = String(text || '').trim()
   if (!body) return ''
-  const tag = session ? ` @${session}` : ''
+  // 落点与 @session 两个 token 之间必须有空格。
+  //
+  // 踩过的坑：早先写成 `${where}${tag}`，而 where 以 "/" 结尾，于是拼出
+  // "zero-agi@record/2026-11-03/@<uuid>" —— 会话 id 被粘进路径，
+  // 而 put 的会话识别要求 token 以 "@" 开头且不含 "/"，因此没被识别，
+  // 结果是目录里多出一层 "@<uuid>"，且面板上无法按会话分组。
+  // 用数组 join 拼，从形状上杜绝这类漏空格。
+  const parts = ['put']
+  if (target) parts.push(`${target}/`)
+  if (session) parts.push(`@${session}`)
+  parts.push('--', '$TEXT')
 
   // put 的 kind 由落点项目的写入策略决定；插件不再发旧版 note kind。
   // 服务端命令为 put [<tree>] -- $TEXT，正文走 vars，不参与 DSL 切分。
-  return term(cfg, `put${tag} -- $TEXT`, 8000, { TEXT: body })
+  return term(cfg, parts.join(' '), 8000, { TEXT: body })
+}
+
+/** 当天日期段（YYYY-MM-DD）。用记录自身时间，不用写入时间。 */
+function daySegment(d) {
+  const t = d instanceof Date && !Number.isNaN(d.getTime()) ? d : new Date()
+  const p = (n) => String(n).padStart(2, '0')
+  return `${t.getFullYear()}-${p(t.getMonth() + 1)}-${p(t.getDate())}`
 }
 
 // 最终回复自动落盘：
@@ -1368,7 +1398,8 @@ export default function zeroMemcp(pi) {
     if (!cfg.enabled) return false
 
     try {
-      await putRecord(cfg, text, sessionId)
+      const where = cfg.recordScope ? `${cfg.recordScope}/${daySegment(new Date())}` : ''
+      await putRecord(cfg, text, sessionId, where)
       // 只有写成功才认为这一轮结束了。写失败时留着，下一轮再试。
       seenMemories.add(key)
       pendingAnswer = ''
@@ -1453,7 +1484,8 @@ export default function zeroMemcp(pi) {
       const h8 = checksumOf(text)
 
       try {
-        await putRecord(cfg, text, sessionId)
+        const where = cfg.recordScope ? `${cfg.recordScope}/${daySegment(new Date())}` : ''
+        await putRecord(cfg, text, sessionId, where)
         // 只有写成功才推进水位
         await saveWatermark(sessionId, turnIdx, h8)
         written++
@@ -1546,6 +1578,46 @@ export default function zeroMemcp(pi) {
     if (!sessionId) sessionId = 'oneshot'
     const fromMessages = extractTurn(event?.messages)
     await flush('turn_end', fromMessages)
+  })
+
+  // 捕获上下文压缩摘要：写入事实层（factScope）。
+  //
+  // 为什么在这里接：模型刚把之前的对话压成一份结构化摘要（Goal / Decisions
+  // / Progress）。这是三层里信息密度最高的内容——平常问答记了十几万字，
+  // 提炼出来的结论就这几百字。写进 factScope 之后，未来的查询第一跳
+  // 就能直接拿到这份结论，不必在数千条问答细节里大海捞针。
+  pi.on('session_compact', async (event) => {
+    if (skip) return
+    const cfgNow = await cfgPromise
+    if (!cfgNow.enabled) return
+    // 同样受 identity 约束：未挂载身份的会话不往事实层落盘
+    if (!identityActive(cfgNow)) return
+
+    const summary = String(event?.compactionEntry?.summary || '').trim()
+    if (!summary) return
+    const target = cfgNow.factScope || ''
+    if (!target) return
+
+    const at = event?.compactionEntry?.timestamp ? new Date(event.compactionEntry.timestamp) : new Date()
+    const day = daySegment(at)
+    const sid = sessionId || 'unknown'
+    const tokens = event?.compactionEntry?.tokensBefore || 0
+
+    // 格式与历史导入保持同构：带标准 frontmatter，未来可统一审计。
+    // 注意别用 filter 去空行——那会把 frontmatter 与正文之间的空行一起
+    // 删掉，格式立刻变形。这里按需拼行。
+    const fm = ['---', 'layer: fact', `session: ${sid}`, `at: ${at.toISOString()}`]
+    if (tokens) fm.push(`tokens_before: ${tokens}`)
+    fm.push('---', '', '# Compaction summary', '', summary, '')
+    const frontmatter = fm.join('\n')
+
+    try {
+      const where = `${target}/${day}`
+      await putRecord(cfgNow, frontmatter, sid, where)
+    } catch (err) {
+      // 事实层写入失败不阻断对话，但记事件供排查
+      pi.events?.emit?.('zero-memcp:fact-write-error', { error: String(err), session: sid })
+    }
   })
 
   // 会话关闭前最后兜一次，避免最后一句没写完就断了。
