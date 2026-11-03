@@ -191,6 +191,12 @@ const DEFAULTS = {
   // 留空表示不分层，走 put 的默认落点（由服务端的 stream 策略决定）。
   recordScope: '',
   factScope: '',
+  // thoughtScope：推理链落点。留空表示不记录思考。
+  //
+  // 体积是问答的 4~5 倍（历史数据里 thinking 占全部正文的 71.7%），
+  // 所以它排在回落链最后一环：只有事实层和记录层都没答案时才会被翻出来，
+  // 不占日常召回的成本。
+  thoughtScope: '',
   // 分层回落的总超时。比单次 recall 宽松：一次三层回落最多要做三次
   // 检索，200ms 会把正常查询误判成超时（超时=静默丢弃，看起来像没记忆）。
   recallLayerTimeoutMs: 2000,
@@ -438,23 +444,37 @@ function checksumOf(text) {
 
 /** 读某会话的上传水位。没有就是 0（一条都还没写过）。 */
 async function loadWatermark(sessionId) {
-  if (!sessionId) return { idx: 0, hash: '', at: 0 }
+  if (!sessionId) return { idx: 0, thinkIdx: 0, hash: '', at: 0 }
   try {
     const raw = await readFile(join(WM_DIR, `${sessionId.replace(/[^a-zA-Z0-9._-]/g, '_')}.json`), 'utf8')
     const d = JSON.parse(raw)
-    return { idx: Number(d.idx) || 0, hash: String(d.hash || ''), at: Number(d.at) || 0 }
+    return {
+      idx: Number(d.idx) || 0,
+      thinkIdx: Number(d.thinkIdx) || 0,
+      hash: String(d.hash || ''),
+      at: Number(d.at) || 0,
+    }
   } catch {
-    return { idx: 0, hash: '', at: 0 }
+    return { idx: 0, thinkIdx: 0, hash: '', at: 0 }
   }
 }
 
-/** 记下水位。只在写成功后调用——失败时水位不动，下次会从这里重放。 */
-async function saveWatermark(sessionId, idx, hash) {
+/**
+ * 记下水位。只在写成功后调用——失败时水位不动，下次会从这里重放。
+ *
+ * 必须是合并写入，不能整体覆盖：记录层与想法层各有一个独立游标
+ * （idx / thinkIdx）。整体覆盖会让「补思考」这一步把 record 的进度
+ * 抹回 0，下一轮 sync 就把整场会话重写一遍——虽然有服务端判重兜底，
+ * 但那意味着每次 sync 都白发几百个请求。
+ */
+async function saveWatermark(sessionId, patch) {
   if (!sessionId) return
   try {
     await mkdir(WM_DIR, { recursive: true })
     const file = join(WM_DIR, `${sessionId.replace(/[^a-zA-Z0-9._-]/g, '_')}.json`)
-    await writeFile(file, JSON.stringify({ idx, hash, at: Date.now() }))
+    const cur = await loadWatermark(sessionId)
+    const next = { ...cur, ...patch, at: Date.now() }
+    await writeFile(file, JSON.stringify(next))
   } catch {}
 }
 
@@ -744,6 +764,13 @@ function renderHits(hits) {
     '</recalled_memories>',
   ].join('\n')
 }
+
+// 思考层的切片与渲染直接复用导入工具的同一份实现。
+//
+// 为什么不自带一份：切片边界和 frontmatter 一旦两边写法不同，历史数据
+// 与新对话就变成两个语料库——同一个 recall 里它们的 docLen、字段、
+// 甚至能否被 parseSliceMeta 识别都会不一致。一条规则只应存在一处。
+import { chunkThinking, renderThought } from './bin/layer-import-lib.js'
 
 export default function zeroMemcp(pi) {
   let cfgPromise = loadConfig()
@@ -1376,14 +1403,41 @@ export default function zeroMemcp(pi) {
     return { q, a }
   }
 
+  /**
+   * 从本轮消息里抽出推理链（thinking 块）。
+   *
+   * 只取本轮（最后一条 user 之后）的 assistant 消息，避免把上几轮的推理
+   * 重复归到这一轮——thinking 在会话里是逐轮累积的，全量抽取会让同一段
+   * 推理在每一轮都落一次盘。
+   */
+  function extractThinking(messages) {
+    if (!Array.isArray(messages) || !messages.length) return ''
+    let ui = -1
+    for (let i = messages.length - 1; i >= 0; i--) {
+      if (messages[i]?.role === 'user') { ui = i; break }
+    }
+    if (ui < 0) return ''
+    const parts = []
+    for (let i = ui + 1; i < messages.length; i++) {
+      const m = messages[i]
+      if (m?.role !== 'assistant') continue
+      const c = m.content
+      if (!Array.isArray(c)) continue
+      for (const p of c) {
+        if (p && p.type === 'thinking' && typeof p.thinking === 'string' && p.thinking.trim()) {
+          parts.push(p.thinking)
+        }
+      }
+    }
+    return parts.join('\n\n').trim()
+  }
+
   /** 写盘。成功才清 pending，失败保留待下次重试。 */
-  async function flush(why, turn) {
+  async function flush(why, turn, thinkingText) {
     const t = turn || (pendingAnswer ? { q: turnUserText, a: pendingAnswer } : null)
     if (!t || !t.a) return false
 
     // 非交互模式（pi -p）不发 session_start，sessionId 还是空串。
-    // 空 session 会让这条记忆丢掉「属于哪个会话」，面板上全归到未分组；
-    // 而且 loadWatermark('') 永远返回 0，水位永远不推进。
     if (!sessionId) sessionId = 'oneshot'
 
     const text = t.q ? `**问**：${t.q}\n\n**答**：${t.a}` : t.a
@@ -1397,22 +1451,44 @@ export default function zeroMemcp(pi) {
     const cfg = await cfgPromise
     if (!cfg.enabled) return false
 
+    const now = new Date()
+    const day = daySegment(now)
+
     try {
-      const where = cfg.recordScope ? `${cfg.recordScope}/${daySegment(new Date())}` : ''
-      await putRecord(cfg, text, sessionId, where)
+      // 1) 问答对写进记录层
+      const whereRecord = cfg.recordScope ? `${cfg.recordScope}/${day}` : ''
+      await putRecord(cfg, text, sessionId, whereRecord)
+
+      // 2) 推理链写进想法层（配置了 thoughtScope 且当前轮有 thinking）
+      if (cfg.thoughtScope && thinkingText && thinkingText.trim()) {
+        const chunks = chunkThinking(thinkingText)
+        const whereThought = `${cfg.thoughtScope}/${day}`
+        for (let i = 0; i < chunks.length; i++) {
+          const body = renderThought(
+            { ask: t.q, thinking: chunks[i], at: now },
+            sessionId,
+            i + 1,
+            chunks.length,
+          )
+          try {
+            await putRecord(cfg, body, sessionId, whereThought)
+          } catch (terr) {
+            // thought 写入失败不阻断 record：记录比想法优先
+            pi.events?.emit?.('zero-memcp:thought-write-error', { error: String(terr), session: sessionId })
+          }
+        }
+      }
+
       // 只有写成功才认为这一轮结束了。写失败时留着，下一轮再试。
       seenMemories.add(key)
       pendingAnswer = ''
       turnUserText = ''
       lastHealthy = true
 
-      // 每写成功一轮就推进水位，这样即便进程突然被杀，
-      // 下次重启也知道该从哪继续，而不是从头重放整条会话。
       const cur = await loadWatermark(sessionId)
-      await saveWatermark(sessionId, cur.idx + 1, checksumOf(text))
+      await saveWatermark(sessionId, { idx: cur.idx + 1, hash: checksumOf(text) })
       return true
     } catch (err) {
-      // 写失败 = 连接出问题了。标记出来，下一轮健康检查成功时触发重放。
       lastHealthy = false
       pi.events?.emit?.('zero-memcp:auto-write-error', { error: String(err), why })
       return false
@@ -1487,7 +1563,7 @@ export default function zeroMemcp(pi) {
         const where = cfg.recordScope ? `${cfg.recordScope}/${daySegment(new Date())}` : ''
         await putRecord(cfg, text, sessionId, where)
         // 只有写成功才推进水位
-        await saveWatermark(sessionId, turnIdx, h8)
+        await saveWatermark(sessionId, { idx: turnIdx, hash: h8 })
         written++
       } catch {
         // 失败停下：水位留在上一条成功的，下次连上继续重放
@@ -1495,6 +1571,58 @@ export default function zeroMemcp(pi) {
       }
       i = j - 1
     }
+
+    // 补思考层：用独立游标 thinkIdx。
+    //
+    // 为什么要独立：record 的水位早就到顶了（历史会话都同步过），
+    // 复用同一个游标意味着 thinking 永远补不回来——「已是最新」会
+    // 把它挡在门外。两个游标各管一层，互不牵连。
+    if (cfg.thoughtScope) {
+      const thinkTurns = []
+      let ti = 0
+      for (let i = 0; i < msgs.length; i++) {
+        if (msgs[i]?.role !== 'user') continue
+        let j = i + 1
+        const parts = []
+        for (; j < msgs.length; j++) {
+          const m = msgs[j]
+          if (m?.role === 'user') break
+          if (m?.role !== 'assistant') continue
+          const c = m.content
+          if (!Array.isArray(c)) continue
+          for (const p of c) {
+            if (p && p.type === 'thinking' && typeof p.thinking === 'string' && p.thinking.trim()) {
+              parts.push(p.thinking)
+            }
+          }
+        }
+        const think = parts.join('\n\n').trim()
+        ti++
+        if (think) thinkTurns.push({ idx: ti, q: stripMem(textOf(msgs[i])), think })
+        i = j - 1
+      }
+
+      for (const t of thinkTurns) {
+        if (t.idx <= wm.thinkIdx) continue
+        const now = new Date()
+        const chunks = chunkThinking(t.think)
+        const whereThought = `${cfg.thoughtScope}/${daySegment(now)}`
+        let ok = true
+        for (let k = 0; k < chunks.length; k++) {
+          const body = renderThought({ ask: t.q, thinking: chunks[k], at: now }, sessionId, k + 1, chunks.length)
+          try {
+            await putRecord(cfg, body, sessionId, whereThought)
+          } catch {
+            ok = false
+            break
+          }
+        }
+        if (!ok) break
+        await saveWatermark(sessionId, { thinkIdx: t.idx })
+        written++
+      }
+    }
+
     return written
   }
 
@@ -1553,7 +1681,8 @@ export default function zeroMemcp(pi) {
       return
     }
     const fromMessages = extractTurn(event?.messages)
-    await flush('agent_end', fromMessages)
+    const thinkText = extractThinking(event?.messages)
+    await flush('agent_end', fromMessages, thinkText)
   })
 
   // 非交互模式的落盘口。
@@ -1577,7 +1706,8 @@ export default function zeroMemcp(pi) {
     // 面板上全都归到「未分组」。给一个可辨识的兜底名。
     if (!sessionId) sessionId = 'oneshot'
     const fromMessages = extractTurn(event?.messages)
-    await flush('turn_end', fromMessages)
+    const thinkText = extractThinking(event?.messages)
+    await flush('turn_end', fromMessages, thinkText)
   })
 
   // 捕获上下文压缩摘要：写入事实层（factScope）。
