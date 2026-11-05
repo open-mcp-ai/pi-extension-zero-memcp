@@ -280,6 +280,45 @@ async function saveGlobalConfig(patch) {
  */
 let activeIdentityName = ''
 
+/**
+ * 取当前身份对应的分层落点与召回范围。
+ *
+ * 优先级：
+ *   1. cfg.personas[activeName]  显式分身配置（权威）
+ *   2. cfg.recordScope 等全局字段（单身份时代的旧配置兼容）
+ *
+ * 为什么不能全放全局字段：全局字段只有一份，而会话会换身份（/mem:identity zero）。
+ * 切了身份但落点没切，结果就是 zero 拿着 zero 的凭证往 weft@main.record 写——
+ * 服务端挂载表当场以 missing w permission 拒绝，写入静默失败，
+ * 表现是「简的对话一篇都没记下来」。
+ *
+ * 每个分身必须自成一套完整的认知闭环：
+ *   - 自己的一问一答落到自己的 record
+ *   - 自己的思维链落到自己的 thought
+ *   - 自己的召回链路优先翻自己的记忆，其次才是跨分身只读层
+ */
+function scopesFor(cfg, identityName) {
+  const name = identityName || activeIdentityName || cfg?.identityName || ''
+  const p = (cfg?.personas && name && cfg.personas[name]) || null
+  if (p) {
+    return {
+      persona: name,
+      recordScope: p.recordScope || '',
+      thoughtScope: p.thoughtScope || '',
+      factScope: p.factScope || '',
+      recallScopes: Array.isArray(p.recallScopes) ? p.recallScopes.filter(Boolean) : [],
+    }
+  }
+  // 旧单身份配置兼容
+  return {
+    persona: name || 'default',
+    recordScope: cfg?.recordScope || '',
+    thoughtScope: cfg?.thoughtScope || '',
+    factScope: cfg?.factScope || '',
+    recallScopes: Array.isArray(cfg?.recallScopes) ? cfg.recallScopes.filter(Boolean) : [],
+  }
+}
+
 /** 取当前生效的凭证：具名凭证优先，否则默认凭证。 */
 function tokenOf(cfg) {
   if (!cfg) return ''
@@ -315,6 +354,64 @@ function credentialInfo(token) {
   } catch {
     return null
   }
+}
+
+/**
+ * 校验一张凭证能不能写进一个 scope。
+ *
+ * 为什么要交叉校验：personas 表和凭证挂载表是同一件事的两个说法——
+ * 「这个人格的记忆存在哪」与「这张票能写哪」。它们不一致时，
+ * 写入会在服务端被拒，而且是被 catch 吃掉、不报错的静默失败。
+ * 与其等写入失败后再去查日志，不如挂载身份的那一刻就说清楚。
+ *
+ * 返回空数组表示通过，否则每个元素是一条人话错误。
+ */
+function validatePersonaScope(cfg, name) {
+  const problems = []
+  const token = (cfg.tokens && cfg.tokens[name]) || ''
+  const info = credentialInfo(token)
+  if (!info) {
+    if (token) problems.push(`tokens.${name} 不是可解析的 JWT`)
+    else problems.push(`tokens 里没有 ${name}`)
+    return problems
+  }
+
+  const p = cfg.personas && cfg.personas[name]
+  if (!p) {
+    problems.push(`personas 里没有 ${name}：这个身份没有声明自己的记忆落在哪，写入会被服务端拒绝`)
+    return problems
+  }
+
+  // 挂载表可能为空（root 凭证 = 全命名空间），此时不做限制。
+  const mounts = Array.isArray(info.mount) ? info.mount : []
+  if (!mounts.length) return problems
+
+  const canWrite = (scope) => {
+    if (!scope) return true
+    // scope 形如 project@branch:path 或 project@branch/path
+    const at = scope.indexOf('@')
+    if (at < 0) return true
+    const project = scope.slice(0, at)
+    const rest = scope.slice(at + 1)
+    const cut = rest.search(/[:/]/)
+    const branch = cut < 0 ? rest : rest.slice(0, cut)
+    return mounts.some((m) => {
+      if (m.project !== project) return false
+      // 挂载点没写分支 = 全分支
+      if (m.branch && m.branch !== branch) return false
+      const cap = m.cap || info.cap || ''
+      return cap === '' || cap.includes('w')
+    })
+  }
+
+  for (const key of ['recordScope', 'thoughtScope', 'factScope']) {
+    const scope = p[key]
+    if (!scope) continue
+    if (!canWrite(scope)) {
+      problems.push(`${key} = ${scope} 超出凭证挂载表的写权限（服务端会拒写）`)
+    }
+  }
+  return problems
 }
 
 /**
@@ -685,7 +782,7 @@ function latestUserText(messages) {
  * 拼进去就成了语法的一部分。
  */
 async function recallLayered(cfg, text) {
-  const scopes = Array.isArray(cfg.recallScopes) ? cfg.recallScopes.filter(Boolean) : []
+  const scopes = scopesFor(cfg).recallScopes
   if (!scopes.length) return null
 
   const cmd = scopes
@@ -1043,15 +1140,26 @@ export default function zeroMemcp(pi) {
           )
           return
         }
-        activeIdentityName = name
-        if (sessionId) await saveSessionSetting(sessionId, { identityName: name })
-        // 换了凭证就是换了一个世界：身份块、SSE 订阅、锚定全部重来。
-        identity = ''
-        identityAt = 0
-        identityError = null
-        restartSSE()
-        anchorWatchedTrees(cfg).catch(() => {})
-        cmdCtx?.ui?.notify?.(`本会话身份已切换为: ${name}（下一轮对话生效）`, 'info')
+    const sc = scopesFor(cfgNow)
+    const problems = validatePersonaScope(cfgNow, name)
+    if (problems.length > 0) {
+      cmdCtx?.ui?.notify?.(
+        `身份 "${name}" 配置有风险：\n${problems.map((p) => `  - ${p}`).join('\n')}`,
+        'warning',
+      )
+    }
+    activeIdentityName = name
+    if (sessionId) await saveSessionSetting(sessionId, { identityName: name })
+    // 换了凭证就是换了一个世界：身份块、SSE 订阅、锚定全部重来。
+    identity = ''
+    identityAt = 0
+    identityError = null
+    restartSSE()
+    anchorWatchedTrees(cfgNow).catch(() => {})
+    cmdCtx?.ui?.notify?.(
+      `本会话身份已切换为: ${name}（落点: ${sc.recordScope || '默认'}）`,
+      'info',
+    )
         return
       }
 
@@ -1457,16 +1565,17 @@ export default function zeroMemcp(pi) {
 
     const now = new Date()
     const day = daySegment(now)
+    const sc = scopesFor(cfg)
 
     try {
-      // 1) 问答对写进记录层
-      const whereRecord = cfg.recordScope ? `${cfg.recordScope}/${day}` : ''
+      // 1) 问答对写进记录层（按当前分身的人格落点）
+      const whereRecord = sc.recordScope ? `${sc.recordScope}/${day}` : ''
       await putRecord(cfg, text, sessionId, whereRecord)
 
       // 2) 推理链写进想法层（配置了 thoughtScope 且当前轮有 thinking）
-      if (cfg.thoughtScope && thinkingText && thinkingText.trim()) {
+      if (sc.thoughtScope && thinkingText && thinkingText.trim()) {
         const chunks = chunkThinking(thinkingText)
-        const whereThought = `${cfg.thoughtScope}/${day}`
+        const whereThought = `${sc.thoughtScope}/${day}`
         for (let i = 0; i < chunks.length; i++) {
           const body = renderThought(
             { ask: t.q, thinking: chunks[i], at: now },
@@ -1521,6 +1630,7 @@ export default function zeroMemcp(pi) {
   // liveCtx 只在「调用方手里有新鲜 ctx」时传（工具、命令）。
   // 异步回调一律不传——那时手里的 ctx 可能已经作废了。
   async function syncSessionFromWatermark(cfg, liveCtx) {
+    const sc = scopesFor(cfg)
     let entries = []
     try {
       if (liveCtx) {
@@ -1564,7 +1674,7 @@ export default function zeroMemcp(pi) {
       const h8 = checksumOf(text)
 
       try {
-        const where = cfg.recordScope ? `${cfg.recordScope}/${daySegment(new Date())}` : ''
+        const where = sc.recordScope ? `${sc.recordScope}/${daySegment(new Date())}` : ''
         await putRecord(cfg, text, sessionId, where)
         // 只有写成功才推进水位
         await saveWatermark(sessionId, { idx: turnIdx, hash: h8 })
@@ -1581,7 +1691,7 @@ export default function zeroMemcp(pi) {
     // 为什么要独立：record 的水位早就到顶了（历史会话都同步过），
     // 复用同一个游标意味着 thinking 永远补不回来——「已是最新」会
     // 把它挡在门外。两个游标各管一层，互不牵连。
-    if (cfg.thoughtScope) {
+    if (sc.thoughtScope) {
       const thinkTurns = []
       let ti = 0
       for (let i = 0; i < msgs.length; i++) {
@@ -1610,7 +1720,7 @@ export default function zeroMemcp(pi) {
         if (t.idx <= wm.thinkIdx) continue
         const now = new Date()
         const chunks = chunkThinking(t.think)
-        const whereThought = `${cfg.thoughtScope}/${daySegment(now)}`
+        const whereThought = `${sc.thoughtScope}/${daySegment(now)}`
         let ok = true
         for (let k = 0; k < chunks.length; k++) {
           const body = renderThought({ ask: t.q, thinking: chunks[k], at: now }, sessionId, k + 1, chunks.length)
@@ -1729,7 +1839,7 @@ export default function zeroMemcp(pi) {
 
     const summary = String(event?.compactionEntry?.summary || '').trim()
     if (!summary) return
-    const target = cfgNow.factScope || ''
+    const target = scopesFor(cfgNow).factScope || ''
     if (!target) return
 
     const at = event?.compactionEntry?.timestamp ? new Date(event.compactionEntry.timestamp) : new Date()
@@ -1826,7 +1936,8 @@ export default function zeroMemcp(pi) {
 
     // 已配置分层：走一条 '||' 回落链，只把真正答上来的那一层放进上下文。
     // 没配置分层：保持老的单次全局检索（返回地址列表）。
-    const layered = Array.isArray(cfg.recallScopes) && cfg.recallScopes.length > 0
+    const sc = scopesFor(cfg)
+    const layered = sc.recallScopes.length > 0
 
     if (layered) {
       try {
