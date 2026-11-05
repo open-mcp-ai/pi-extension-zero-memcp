@@ -103,7 +103,11 @@ function startSSEListener(pi, getCfg, onTreeEvent, isBusy) {
       if (!res.ok) throw new Error(`SSE ${res.status}`)
       connected = true
       retryDelay = 1000
-      console.log(`[zero-memcp] SSE 已连接 ${url}`)
+      // 默认静默：SSE 连上是常态，打到 stdout 会在 TUI 输入框上方
+      // 刷一行噪音。需要排障时设 ZERO_MEMCP_DEBUG=1，日志走 stderr。
+      if (process.env.ZERO_MEMCP_DEBUG) {
+        process.stderr.write(`[zero-memcp] SSE 已连接 ${url}\n`)
+      }
 
       const reader = res.body.getReader()
       const decoder = new TextDecoder()
