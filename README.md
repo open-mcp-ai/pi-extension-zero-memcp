@@ -41,18 +41,48 @@ ln -s /path/to/pi-extension-zero-memcp ~/.pi/agent/extensions/zero-memcp
 {
   "endpoint": "http://127.0.0.1:1729",
   "enabled": true,
+
   "importMode": "off",
+  "syncSessionOnStart": false,
+
   "identity": "off",
   "identityName": "",
+  "identityTtlMs": 3600000,
+
   "token": "",
   "tokens": {},
-  "watch": "daily@zero,notes@zero/team",
+
+  "watch": "BlackEggAI/zero@main.record",
+
   "recallLimit": 3,
   "recallTimeoutMs": 200,
-  "recallScopes": ["zero-agi@fact", "zero-agi@record", "zero-agi@thought"],
-  "recallLayerTimeoutMs": 2000
+  "recallLayerTimeoutMs": 2000,
+
+  "recallScopes": [
+    "BlackEggAI/zero@main.record:fact",
+    "BlackEggAI/zero@main.record:record"
+  ],
+  "recallScopeLimit": 3,
+  "recordScope": "BlackEggAI/zero@main.record:record",
+  "factScope": "BlackEggAI/zero@main.record:fact",
+  "thoughtScope": "BlackEggAI/zero@main.record:thought",
+
+  "personas": {
+    "laptop": {
+      "recordScope": "BlackEggAI/zero@main.record:record",
+      "factScope": "BlackEggAI/zero@main.record:fact",
+      "thoughtScope": "BlackEggAI/zero@main.record:thought",
+      "recallScopes": [
+        "BlackEggAI/zero@main.record:fact",
+        "BlackEggAI/zero@main.record:record"
+      ]
+    }
+  }
 }
 ```
+
+`identityTtlMs` 控制身份块的重取周期（默认 1 小时）。改过服务端的规则块或
+personas 之后，最多等一个周期就能在当前会话里看到新内容，不必重开会话。
 
 `watch` 是 SSE 订阅的树地址（逗号分隔）。服务端的 tree 事件**只推给
 remind 锚定过的人**——不填 `watch` 就收不到变更通知，而且不会报错。
@@ -85,6 +115,39 @@ recall $Q --scope zero-agi@fact || recall $Q --scope zero-agi@record || recall $
 `recallLayerTimeoutMs` 比 `recallTimeoutMs` 宽松（默认 2000ms）：一次回落链
 最多做三次检索，200ms 会把正常查询误判成超时，而超时是静默丢弃——
 看起来就像「记忆库里没有」。
+
+### 分层写入（`recordScope` / `factScope` / `thoughtScope`）
+
+读的时候按可信度分了三层，写的时候也必须分层——否则这套分层只对历史数据
+成立，新对话立刻退化成一锅粥。
+
+| 配置 | 内容 | 特点 |
+|---|---|---|
+| `recordScope` | 一问一答 | 默认落点，量最大 |
+| `factScope` | compaction 摘要 | 信息密度最高（几十万字压成几百字） |
+| `thoughtScope` | thinking 推理链 | 体积是问答的 4~5 倍，留空即不记录 |
+
+`factScope` 接在 `session_compact` 事件上：Pi 压缩对话时产出的结构化摘要
+（Goal / Decisions / Progress）直接写进事实层。这样未来的查询第一跳就能
+拿到结论，不必在数千条问答细节里大海捞针。
+
+### 人格映射（`personas`）
+
+一个身份一张凭证，每张凭证有自己的挂载表。`personas` 把「这个人格的记忆
+存在哪」写下来：
+
+```json
+"personas": {
+  "laptop": {
+    "recordScope": "BlackEggAI/zero@main.record:record",
+    "recallScopes": ["BlackEggAI/zero@main.record:fact"]
+  }
+}
+```
+
+`personas` 声明的 scope 必须落在对应凭证的挂载范围内。不一致时写入会在
+服务端被拒——插件在挂载身份的那一刻就会把这个问题报出来，而不是等写入
+失败后让人对着日志猜。
 
 ---
 
@@ -144,10 +207,35 @@ mem({ cmd: "recall 数据库选型" })
 | | `mem grep <regex>` | 正则精确搜符号/数字/函数名 |
 | | `mem log [N]` | 最近 N 篇 |
 | | `mem ls [date]` | 列某天的切片 |
+| | `mem trees <project>[@<br>]` | 查看树目录 |
+| | `mem since <tree> <commit>` | 取某提交之后的差分 |
+| | `mem remind [<tree>]` | 锚定子树并接收 SSE 变更通知 |
+| | `mem status`（服务端） | 索引规模、**语义后端与降级状态**、**同步现场与冲突** |
 | **记忆写入**（透传服务） | `mem put [<tree>] -- $TEXT` | 写入脏层（正文必须走 `vars` / `args`，不拼进命令） |
 | | `mem put <tree> --ref <addr>` | 在树里追加已有记忆的引用 |
-| | `mem commit [<p>[@<br>]]` | 显式折叠脏层为 Git 提交 |
+| | `mem write <p>@<br>/<path> -- T` | 精确写入指定路径（规则库用，需 root） |
+| | `mem batch {"ops":[...]}` | 原子批量：多步合成一次提交 |
+| **结构维护**（透传服务） | `mem commit [<p>[@<br>]]` | 显式折叠脏层为 Git 提交 |
 | | `mem diff <p>@<br>` | 分支比对 / 提取未审脏流 |
+| | `mem branch [<p> [<new>]]` | 列出或派生分支 |
+| | `mem tag [-d] <p> [<name>]` | 轻量标签 |
+| | `mem cp / mv <src> -> <dst>` | 跨分支搬运条目 |
+| | `mem delete <p>@<br>/<path>...` | 删除条目 |
+| | `mem archive <p>@<br>` | 归档分支 |
+| | `mem reset <p>@<br> from <src>` | 把分支重置到另一分支 |
+| | `mem lock / unlock <p>@<br>` | 锁定/解锁分支（暂停非 root 访问） |
+| | `mem chmod <p>@<br>/<path> mode` | 改规则/内容权限位 |
+| **多机同步**（透传服务） | `mem remote [<project>]` | 列出配置的远端 |
+| | `mem sync <project> [<remote>]` | 对比本地与远端状态（含自动同步时间与待决议冲突） |
+| | `mem fetch <project> [<remote>]` | 取回远端历史，不自动覆盖本地分支 |
+| | `mem push <project> [<remote>] <branch>` | 显式推一条分支（不替你提交、不强推） |
+| | `mem merge <project> <branch> from <remote>` | 把远端分支合并进本地（快进或正交合并；冲突则拒绝） |
+| | `mem remote-key list\|put\|delete` | root 管理 SSH 私钥 |
+| | `mem remote-secret list\|put\|delete` | root 管理 HTTP token |
+
+> 服务端实际有 33 个动词。上面这张表就是模型看到的全部能力——**漏一个
+> 就等于那个能力不存在**，因为模型不会去猜没被声明的动词。
+> 完整清单随时可用 `mem({ cmd: "help" })` 取回；单动词细节用 `help <verb>`。
 
 ## 记忆写入与模式说明
 

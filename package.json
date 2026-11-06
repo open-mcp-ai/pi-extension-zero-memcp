@@ -5,7 +5,9 @@
   "type": "module",
   "main": "index.js",
   "bin": {
-    "zero-memcp-import": "./bin/import-sessions.js"
+    "zero-memcp-import": "./bin/import-sessions.js",
+    "zero-memcp-layer-import": "./bin/layer-import.js",
+    "zero-memcp-sync-me": "./bin/sync-me.js"
   },
   "repository": {
     "type": "git",
@@ -23,5 +25,8 @@
   "license": "MIT",
   "peerDependencies": {
     "@mariozechner/pi": ">=0.1.0"
+  },
+  "scripts": {
+    "test": "node --test tests/*.test.mjs"
   }
 }

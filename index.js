@@ -94,14 +94,12 @@ function startSSEListener(pi, getCfg, onTreeEvent, isBusy) {
     const url = `${cfg.endpoint}/events`
 
     abortCtrl = new AbortController()
-    let connected = false
     try {
       const res = await fetch(url, {
         headers: authHeaders(cfg, { Accept: 'text/event-stream' }),
         signal: abortCtrl.signal,
       })
       if (!res.ok) throw new Error(`SSE ${res.status}`)
-      connected = true
       retryDelay = 1000
       // 默认静默：SSE 连上是常态，打到 stdout 会在 TUI 输入框上方
       // 刷一行噪音。需要排障时设 ZERO_MEMCP_DEBUG=1，日志走 stderr。
@@ -139,7 +137,11 @@ function startSSEListener(pi, getCfg, onTreeEvent, isBusy) {
     // 连接结束（无论成功与否）都要重连；但 abort 与 closed 不再重连，
     // 否则一个插件实例会越攒越多条 SSE 连接。
     if (!closed && abortCtrl && !abortCtrl.signal.aborted) {
-      setTimeout(connect, retryDelay)
+      // 抖动是必须的：服务端重启时所有客户端会在同一毫秒重连，
+      // 那一下的并发是平时的 N 倍（N = 同时开着的会话数）。
+      // ±25% 的随机偏移把这一波摊平，代价只是最坏多等几百毫秒。
+      const jitter = retryDelay * 0.25 * (Math.random() * 2 - 1)
+      setTimeout(connect, Math.max(250, Math.round(retryDelay + jitter)))
       retryDelay = Math.min(retryDelay * 2, 30000)
     }
   }
@@ -350,10 +352,40 @@ function credentialInfo(token) {
       subject: payload.sub || '',
       cap: payload.cap || '',
       mount: payload.mount || [],
+      // exp 是 Unix 秒。能提前知道过期，就不该等 401 才发现。
+      exp: typeof payload.exp === 'number' ? payload.exp : 0,
+      iat: typeof payload.iat === 'number' ? payload.iat : 0,
     }
   } catch {
     return null
   }
+}
+
+/**
+ * 检查当前生效凭证是否已过期或即将过期。
+ *
+ * 返回 null 表示没问题；否则返回一句人话。
+ *
+ * 为什么要提前查：JWT 过期后服务端一律 401，而写入路径的错误会被
+ * flush 的 catch 吃掉（只 emit 一个事件），用户看到的现象是
+ * 「记忆莫名其妙不存了」。这里能读到 exp，就不该等到那时候。
+ */
+function credentialProblem(cfg) {
+  const name = activeIdentityName || cfg.identityName || ''
+  const token = (cfg.tokens && cfg.tokens[name]) || cfg.token || ''
+  if (!token) return null // 服务端可能没开鉴权，不臆断
+  const info = credentialInfo(token)
+  if (!info) return '凭证不是可解析的 JWT，服务端会拒绝'
+  if (!info.exp) return null // 没有 exp 的票（root 长期票）不判
+  const now = Math.floor(Date.now() / 1000)
+  if (info.exp <= now) {
+    return `凭证${name ? ` "${name}"` : ''}已过期（${new Date(info.exp * 1000).toLocaleString()}），需要重新签发`
+  }
+  const leftH = Math.floor((info.exp - now) / 3600)
+  if (leftH < 24) {
+    return `凭证${name ? ` "${name}"` : ''}将在 ${leftH} 小时后过期，建议提前换一张`
+  }
+  return null
 }
 
 /**
@@ -691,7 +723,20 @@ async function term(cfg, cmd, timeoutMs = 5000, vars = {}, args = []) {
     }),
     signal: AbortSignal.timeout(timeoutMs),
   })
-  if (!res.ok) throw new Error(`term ${res.status}`)
+  if (!res.ok) {
+    // 401 是「凭证问题」，和其它 HTTP 错误不是一类事：
+    // 前者需要换票，后者可能是网络或服务异常。混成 "term 401" 让人
+    // 无法判断该去做什么。
+    if (res.status === 401 || res.status === 403) {
+      const name = activeIdentityName || cfg.identityName || ''
+      const hint = credentialProblem(cfg)
+      throw new Error(
+        `凭证被拒（HTTP ${res.status}）${name ? `：${name}` : ''}` +
+          (hint ? ` — ${hint}` : ' — 检查 token 是否有效或已过期'),
+      )
+    }
+    throw new Error(`term ${res.status}`)
+  }
   const body = await res.json()
   if (body.error) throw new Error(body.error.message || 'term failed')
   if (body.result?.isError) {
@@ -924,6 +969,18 @@ export default function zeroMemcp(pi) {
 
   /** 取身份块，带一次性失败标记：失败不重试，避免每个 run 都打一次空请求。 */
   async function ensureIdentity(cfg, piApi) {
+    // TTL 到期就重取一次。
+    //
+    // 早先只判 identity 是否为空，取到就永久缓存——于是改了服务端的
+    // personas / 规则块之后，当前会话永远看不到新内容，必须重开会话。
+    // 而 identityTtlMs 这个配置从写下那天起就没被任何代码读过。
+    //
+    // 到期只清空、不阻塞：取失败时保留旧值（`identityError` 分支会把
+    // identity 留空，下一轮再试），比让每轮都等一次网络好。
+    if (identity && cfg.identityTtlMs > 0 && Date.now()-identityAt >= cfg.identityTtlMs) {
+      identity = ''
+      identityError = null
+    }
     if (identity || identityError) return identity
     try {
       // 身份视角完全由凭证决定：换身份是换一张凭证，不是换一个请求头。
@@ -941,6 +998,16 @@ export default function zeroMemcp(pi) {
   const resetPerRun = () => {
     recallKey = null
     recallHits = []
+  }
+
+  // 会话级彻底清空：新会话不该继承上一个会话的任何残留。
+  // abortedTurn 尤其危险——上一个会话最后一句若被 abort，标志会留成 true，
+  // 新会话第一轮即使正常完成也会被 agent_end 当成 abort 丢掉。
+  const resetPerSession = () => {
+    resetPerRun()
+    abortedTurn = false
+    pendingAnswer = ''
+    turnUserText = ''
   }
 
   // 后台订阅树变更。
@@ -1085,7 +1152,11 @@ export default function zeroMemcp(pi) {
       }
 
       sessionImportMode = target
-      if (!sessionId) sessionId = deriveSessionId(ctx, skip)
+      // 命令 handler 的第二个参数就是 ExtensionCommandContext（含 sessionManager），
+      // 早先这里写了裸 ctx——那是事件 handler 的形参，命令作用域里根本不存在，
+      // 于是 pi -p 这类 sessionId 为空的场景下敲 /mem:record on 直接抛
+      // ReferenceError: ctx is not defined。用 cmdCtx，取不到就保持空串。
+      if (!sessionId) sessionId = deriveSessionId(cmdCtx, skip)
       if (sessionId) await saveSessionSetting(sessionId, { importMode: target })
       cmdCtx?.ui?.notify?.(`本会话记录模式已设为: ${show(target)}`, 'info')
     },
@@ -1191,10 +1262,24 @@ export default function zeroMemcp(pi) {
 
       // 本会话
       sessionIdentity = want
-      if (!sessionId) sessionId = deriveSessionId(ctx, skip)
+      // 同上：命令作用域里只有 cmdCtx，没有 ctx。
+      if (!sessionId) sessionId = deriveSessionId(cmdCtx, skip)
       if (sessionId) await saveSessionSetting(sessionId, { identity: want })
 
       if (want === 'on') {
+        // 挂载前先做交叉校验：personas 声明的落点与凭证挂载表不一致时，
+        // 写入会在服务端被拒，而那条路径的错误会被 flush 的 catch 吃掉、
+        // 用户只看到「记忆没存进去」却不明白为什么。与其等失败，不如现在说。
+        const nameForCheck = activeIdentityName || cfg.identityName || ''
+        if (nameForCheck) {
+          const problems = validatePersonaScope(cfg, nameForCheck)
+          if (problems.length > 0) {
+            cmdCtx?.ui?.notify?.(
+              `身份 "${nameForCheck}" 配置有风险：\n${problems.map((p) => `  - ${p}`).join('\n')}`,
+              'warning',
+            )
+          }
+        }
         // 重取一次：上一次可能是失败的，别让"我已经没有身份了"变成永久状态
         identity = ''
         identityAt = 0
@@ -1240,26 +1325,57 @@ export default function zeroMemcp(pi) {
       "",
       "当前窗口之外的东西不在你的上下文里，但在这里。需要时取，不需要时它不占位。",
       "",
-      "  put [<tree>] -- $TEXT    写入记忆（正文通过 vars/args 传，不拼进 cmd）",
-      "  put <tree> --ref <addr>  在树中追加已有记忆的引用",
-      "  recall <text>            语义联想（返回地址与摘要）",
-      "  read <addr>...           读取全文，可一次读多篇",
-      "  grep <regex>             正则搜索全文",
-      "  log [N]                  最近 N 篇",
-      "  ls [date]                某天的切片",
-      "  trees <project>[@<br>]   查看树目录",
-      "  remind [<tree>]          锚定子树并接收 SSE 通知",
-      "  since <tree> <commit>    获取提交差分",
-      "  commit [<p>[@<br>]]      显式封箱（put 只入队，不提交）",
-      "  diff <p>@<br>            分支比对",
+      "读：",
+      "  recall <text> [--scope T]  语义联想（返回地址与摘要）",
+      "  read <addr>...             读取全文，可一次读多篇",
+      "  grep <regex> [--scope T]   正则搜索全文（精确符号、名字、数字）",
+      "  log [N]                    最近 N 篇的时间线",
+      "  ls [date]                  某天的切片",
+      "  trees <project>[@<br>]     查看树目录",
+      "  status                     索引规模、语义后端、同步状态",
       "",
-      "会话（插件就地处理）：",
-      "  status                   当前凭证、身份、自动记录与索引规模",
-      "  record [on|off]          本会话是否每轮自动存",
-      "  identity [<name>]        查看身份或换一张凭证",
+      "写：",
+      "  put [<tree>] -- $TEXT      写入记忆（正文通过 vars/args 传，不拼进 cmd）",
+      "  put <tree> --ref <addr>    在树中追加已有记忆的引用（不复制正文）",
+      "  write <p>@<br>/<path> -- T 精确写入指定路径（规则库用；需 root）",
+      "  batch {\"ops\":[...]}       原子批量（多步合成一次提交）",
+      "",
+      "维护（日常读写不需要）：",
+      "  commit [<p>[@<br>]]        显式封箱（put 只入队，不提交）",
+      "  diff <p>@<br> [-> <p>@<br>] 分支比对（审计用）",
+      "  branch [<p> [<new> [from s]]] 列出或派生分支",
+      "  tag [-d] <p> [<name> [<ref>]] 轻量标签",
+      "  cp / mv <src> -> <dst>     跨分支搬运条目",
+      "  delete <p>@<br>/<path>...  删除条目",
+      "  archive <p>@<br>           归档分支",
+      "  reset <p>@<br> from <src>  把分支重置到另一个分支",
+      "  lock / unlock <p>@<br>     锁定/解锁分支（暂停非 root 访问）",
+      "  chmod <p>@<br>/<path> mode 改规则/内容权限位",
+      "",
+      "多机同步（远端在服务端配置里声明）：",
+      "  remote [<project>]         列出配置的远端",
+      "  sync <project> [<remote>]  对比本地与远端状态（含自动同步时间与冲突）",
+      "  fetch <project> [<remote>] 取回远端历史，不自动覆盖本地分支",
+      "  push <project> [<remote>] <branch>  显式推一条分支（不替你提交、不强推）",
+      "  merge <project> <branch> from <remote>  把远端分支合并进本地（快进或正交合并，冲突则拒）",
+      "  since <tree> <commit|empty> 取回某提交之后的差分",
+      "  remind [<tree>]            锚定子树并接收 SSE 通知",
+      "  remote-key list|put|delete root 管理 SSH 私钥",
+      "  remote-secret list|put|delete root 管理 HTTP token",
+      "",
+      "一次调用多条语句：",
+      "  用 ';' 或换行分隔，一个来回执行多条。",
+      "  '&&' 上一条找到了才跑下一条；'||' 上一条没找到才跑下一条。",
+      "  「找到」指命中，不是退出码：合法地搜不到不算错误。",
+      "  分层回落用它：recall q --scope p@fact || recall q --scope p@record",
+      "",
+      "会话（插件就地处理，不打服务端）：",
+      "  record [on|off] [global]   本会话是否每轮自动存",
+      "  identity [<name>] [global] 查看身份或换一张凭证",
       "",
       "put 入脏层后立即返回；折叠为 Git 提交由显式 commit 或服务端后台策略决定。",
       "正文必须通过 vars/args 传递，例如 cmd='put notes -- $TEXT', vars={TEXT:'正文'}。",
+      "help <verb> 看单个动词细节；help --all 看全部。",
     ].join("\n"),
     parameters: {
       type: "object",
@@ -1357,8 +1473,10 @@ export default function zeroMemcp(pi) {
           const mark = (sessionVal, globalVal) =>
             sessionVal === null ? `跟随全局（${globalVal}）` : `${sessionVal}，全局默认 ${globalVal}`
 
+          const credIssue = credentialProblem(cfg)
           const lines = [
             `凭证: ${activeIdentityName || cfg.identityName || '（默认凭证）'}`,
+            credIssue ? `⚠ ${credIssue}` : null,
             `端点: ${cfg.endpoint}${reachable ? '' : `（不可达：${err}）`}`,
             `记忆挂载: ${mark(sessionIdentity, globalIdentity)}`,
             `自动记录: ${mark(sessionImportMode, globalMode)}`,
@@ -1408,7 +1526,7 @@ export default function zeroMemcp(pi) {
     identity = ''
     identityAt = 0
     identityError = null
-    resetPerRun()
+    resetPerSession()
     seenMemories.clear()
     entriesGetter = () => {
       try {
@@ -1553,7 +1671,12 @@ export default function zeroMemcp(pi) {
     if (!sessionId) sessionId = 'oneshot'
 
     const text = t.q ? `**问**：${t.q}\n\n**答**：${t.a}` : t.a
-    const key = text.slice(0, 160)
+    // 去重键必须是全文哈希，不能用前缀。
+    //
+    // 早先用 text.slice(0, 160)：同一个问句配不同的答（追问、补充说明，
+    // 非常常见）前 160 字符完全相同，于是第二轮被当成「已写过」直接丢弃。
+    // 那是一种最糟的失败——不报错，只是内容永远没进库。
+    const key = createHash('sha256').update(text, 'utf8').digest('hex')
     if (seenMemories.has(key)) {
       pendingAnswer = ''
       turnUserText = ''
@@ -1603,7 +1726,11 @@ export default function zeroMemcp(pi) {
       return true
     } catch (err) {
       lastHealthy = false
-      pi.events?.emit?.('zero-memcp:auto-write-error', { error: String(err), why })
+      // 凭证过期是最常见的写入失败原因，而且它有自己的解法。
+      // 混在一句原始错误里，用户只能猜。
+      const hint = credentialProblem(cfg)
+      const msg = hint ? `${err}（${hint}）` : String(err)
+      pi.events?.emit?.('zero-memcp:auto-write-error', { error: msg, why })
       return false
     }
   }
@@ -1765,7 +1892,10 @@ export default function zeroMemcp(pi) {
   // turn_end 不写盘——它带 outcome，用它标记「这一轮被打断了」，
   // 被打断的半截不算发生过的事（多数是用户打错字或改主意）。
   pi.on('turn_end', async (event) => {
-    abortedTurn = event?.outcome && event.outcome !== 'completed'
+    // 两个方向都要写：只在上一次为真时不清，会让一次异常的 abort
+    // 残留到下一轮——下一轮即使正常完成，agent_end 也会误判成 abort
+    // 而把整轮内容丢掉。显式赋成布尔值，不依赖上一轮的状态。
+    abortedTurn = Boolean(event?.outcome && event.outcome !== 'completed')
   })
 
   // 主写入点。messages 是权威来源，不依赖累积状态。

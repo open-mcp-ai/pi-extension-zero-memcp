@@ -1,16 +1,57 @@
 {
   "endpoint": "http://127.0.0.1:1729",
   "enabled": true,
+
   "importMode": "off",
   "syncSessionOnStart": false,
+
   "recallLimit": 3,
   "recallTimeoutMs": 200,
-  "recallScopes": [],
-  "recallScopeLimit": 3,
   "recallLayerTimeoutMs": 2000,
+
   "identity": "off",
   "identityName": "",
+  "identityTtlMs": 3600000,
+
   "token": "",
   "tokens": {},
-  "watch": ""
+
+  "watch": "",
+
+  "_comment_scopes": [
+    "分层记忆：读的时候按可信度分三层，写的时候也必须分层——",
+    "否则这套分层只对历史数据成立，新对话立刻退化成一锅粥。",
+    "",
+    "  recallScopes  按优先级排列的检索回落链（'||' 连接，上层命中即停）",
+    "  recordScope   一问一答的落点",
+    "  factScope     compaction 摘要 —— 信息密度最高的提炼结论",
+    "  thoughtScope  推理链落点（体积最大，排在回落链末尾）",
+    "",
+    "留空表示不分层，走服务端默认落点。"
+  ],
+  "recallScopes": [],
+  "recallScopeLimit": 3,
+  "recordScope": "",
+  "factScope": "",
+  "thoughtScope": "",
+
+  "_comment_personas": [
+    "人格 → 记忆落点的映射。一个身份一张凭证，每张凭证有自己的挂载表。",
+    "personas 声明的 scope 必须落在对应凭证的挂载范围内，",
+    "否则写入会被服务端拒绝（插件会在挂载身份时提前报出来）。",
+    "",
+    "示例：",
+    "  \"personas\": {",
+    "    \"laptop\": {",
+    "      \"recordScope\": \"BlackEggAI/zero@main.record:record\",",
+    "      \"factScope\": \"BlackEggAI/zero@main.record:fact\",",
+    "      \"thoughtScope\": \"BlackEggAI/zero@main.record:thought\",",
+    "      \"recallScopes\": [",
+    "        \"BlackEggAI/zero@main.record:fact\",",
+    "        \"BlackEggAI/zero@main.record:record\"",
+    "      ]",
+    "    }",
+    "  }"
+  ],
+  "personas": {}
 }
