@@ -158,8 +158,12 @@ test('源码里不存在命令作用域内的裸 ctx 引用', () => {
   assert.deepEqual(offenders, [], `命令作用域里出现裸 ctx：\n${offenders.join('\n')}`)
 })
 
-test('SSE 重连带抖动，避免服务端重启时的惊群', () => {
-  assert.match(src, /Math\.random\(\)/, 'SSE 重连应带随机抖动')
+test('不再有自定义 SSE 通道（服务端只讲 MCP）', () => {
+  // 这条是反向断言：SSE 订阅/推送已整体移除，防止有人把长连接加回来。
+  // 服务端对外只有一个 /mcp 入口，多一条通道就是多一套要维护的传输。
+  assert.doesNotMatch(src, /startSSEListener/, '不应再有 SSE 监听器')
+  assert.doesNotMatch(src, /text\/event-stream/, '不应再消费事件流')
+  assert.doesNotMatch(src, /\/events/, '不应再连 /events')
 })
 
 test('去重键用全文哈希而不是前缀截断', () => {

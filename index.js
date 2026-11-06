@@ -56,103 +56,6 @@ const CLOCK_FILE = process.env.ZERO_MEMCP_CLOCK || join(homedir(), '.zero-memcp'
 // 水位只有一个小整数，永远只有一条。
 const WM_DIR = process.env.ZERO_MEMCP_WM_DIR || join(homedir(), '.zero-memcp', 'wm')
 
-// ── SSE 实时推送：clock 与 tree ──
-//
-// 服务端只广播两类事件（见 internal/server/sse.go 的 eventAllowed）：
-//   clock  逻辑时钟跳变：有人在别处写了东西
-//   tree   子树提交推进：带 previous / commit / tree / paths
-//
-// 没有 mail、没有 mailbox。记忆库是 Git 树，不是消息队列；
-// 变更感知靠 tree 事件与 remind 锚定，不靠轮询未读数。
-//
-// 三条克制规则：
-//   1. agent 正在思考（busy）时绝不打断，变化留给下一轮 context；
-//   2. 两次唤醒至少间隔 3 秒；
-//   3. 掉线指数退避重连（1s → 2s → … → 30s 封顶）。
-// isBusy 由调用方提供，监听器本身不注册任何 pi 事件。
-//
-// 踩过的坑：这里原本在函数内 pi.on('agent_start'/'agent_end')。
-// 而 restartSSE() 每次换身份都会重新调用本函数，于是每换一次身份
-// 就多注册一对 handler，agent_end 的处理链越攒越长——
-// 表现是同一轮问答被写多遍、以及最后一个 handler 抢走了本该落盘的调用。
-// 注册事件必须只发生一次，所以挪到外面。
-function startSSEListener(pi, getCfg, onTreeEvent, isBusy) {
-  let abortCtrl = null
-  let retryDelay = 1000
-  let closed = false
-
-  async function connect() {
-    if (closed) return
-    // getCfg 返回 Promise：不 await 会拿到一个没有 enabled 字段的 Promise，
-    // 结果是永远不连、也不报错。
-    let cfg = null
-    try { cfg = await getCfg() } catch { cfg = null }
-    if (!cfg || !cfg.enabled) {
-      setTimeout(connect, 5000)
-      return
-    }
-    const url = `${cfg.endpoint}/events`
-
-    abortCtrl = new AbortController()
-    try {
-      const res = await fetch(url, {
-        headers: authHeaders(cfg, { Accept: 'text/event-stream' }),
-        signal: abortCtrl.signal,
-      })
-      if (!res.ok) throw new Error(`SSE ${res.status}`)
-      retryDelay = 1000
-      // 默认静默：SSE 连上是常态，打到 stdout 会在 TUI 输入框上方
-      // 刷一行噪音。需要排障时设 ZERO_MEMCP_DEBUG=1，日志走 stderr。
-      if (process.env.ZERO_MEMCP_DEBUG) {
-        process.stderr.write(`[zero-memcp] SSE 已连接 ${url}\n`)
-      }
-
-      const reader = res.body.getReader()
-      const decoder = new TextDecoder()
-      let buf = ''
-
-      for (;;) {
-        const { value, done } = await reader.read()
-        if (done) break
-        buf += decoder.decode(value, { stream: true })
-        const blocks = buf.split('\n\n')
-        buf = blocks.pop()
-
-        for (const block of blocks) {
-          if (!block.trim() || block.startsWith(':')) continue
-          let evName = 'message'
-          let dataStr = ''
-          for (const line of block.split('\n')) {
-            if (line.startsWith('event: ')) evName = line.slice(7).trim()
-            else if (line.startsWith('data: ')) dataStr = line.slice(6).trim()
-          }
-          if (evName === 'tree' && dataStr) {
-            try { onTreeEvent(JSON.parse(dataStr), isBusy()) } catch {}
-          }
-        }
-      }
-    } catch (err) {
-      if (err && err.name === 'AbortError') return
-    }
-    // 连接结束（无论成功与否）都要重连；但 abort 与 closed 不再重连，
-    // 否则一个插件实例会越攒越多条 SSE 连接。
-    if (!closed && abortCtrl && !abortCtrl.signal.aborted) {
-      // 抖动是必须的：服务端重启时所有客户端会在同一毫秒重连，
-      // 那一下的并发是平时的 N 倍（N = 同时开着的会话数）。
-      // ±25% 的随机偏移把这一波摊平，代价只是最坏多等几百毫秒。
-      const jitter = retryDelay * 0.25 * (Math.random() * 2 - 1)
-      setTimeout(connect, Math.max(250, Math.round(retryDelay + jitter)))
-      retryDelay = Math.min(retryDelay * 2, 30000)
-    }
-  }
-
-  connect()
-
-  return () => {
-    closed = true
-    if (abortCtrl) abortCtrl.abort()
-  }
-}
 
 // 会话级覆盖设置。
 //
@@ -241,11 +144,11 @@ const DEFAULTS = {
   // 一个身份一张凭证。服务端签发时就把能力与挂载范围写死了，
   // 这里只是把它们收在一处，方便按名字切换。
   tokens: {},
-  // 锚定订阅：逗号分隔的树地址，例如 "daily@zero,notes@zero/team"。
+  // 启动时自动登记的关注树：逗号分隔，例如 "daily@zero,notes@zero/team"。
   //
-  // 服务端的 tree 事件只推给 remind 锚定过的人（eventAllowed 里
-  // treeWatch.Matches 就是授权本身）。不锚定 = 收不到，且不报错。
-  // 所以这里必须显式声明要看哪几棵树，而不是"全都推给我"。
+  // 它只影响一件事：`mem status` 会报出这些树「动了没有」。
+  // 服务端不推送任何东西——没有长连接、没有后台唤醒，agent 想看得自己查。
+  // 留空表示不登记；也可以随时用 `mem remind <tree>` 手动加。
   watch: '',
 }
 
@@ -956,7 +859,7 @@ export default function zeroMemcp(pi) {
   //
   // 为什么不直接存 ctx：pi 在 newSession / fork / switchSession / reload
   // 之后会作废旧 ctx，任何在异步回调里继续访问它的代码都会抛
-  // 「This extension ctx is stale」。而 SSE 重连回调可能在几分钟后才跑，
+  // 「This extension ctx is stale」。异步回调（写入、同步）可能几分钟后才跑，
   // 那时会话早换过不止一次了。
   //
   // 所以这里只留一个动作，不留对象：取不到就返回空数组，
@@ -1010,48 +913,15 @@ export default function zeroMemcp(pi) {
     turnUserText = ''
   }
 
-  // 后台订阅树变更。
+  // 关注标记：启动时把 config.watch 声明的树登记到服务端。
   //
-  // 注意这里是唯一的启动点：只定义不调用等于"写了监听器但没接上"，
-  // 而那种故障不报错，只是永远收不到推送。
+  // 这里不再有长连接、不再有推送。原先那套 SSE 订阅已移除——它自造了
+  // 一条协议（自定义 event 名、自定义帧、自定义鉴权语义），而服务端
+  // 对外承诺的只有 MCP。少一条通道就少一套要维护的传输。
   //
-  // 它必须能在身份变化后重启：SSE 连接的身份是建立时那一刻的凭证，
-  // 切换凭证后不重连就等于用旧身份继续收推送。
-  let lastWakeAt = 0
-  let stopSSE = null
-
-  // agent 是否正在思考。只在这里注册一次，SSE 重启不再重复注册。
-  let agentBusy = false
-  pi.on('agent_start', () => { agentBusy = true })
-  pi.on('agent_end', () => { agentBusy = false })
-
-  function restartSSE() {
-    if (stopSSE) {
-      try { stopSSE() } catch {}
-      stopSSE = null
-    }
-    stopSSE = startSSEListener(pi, () => cfgPromise, (ev, busy) => {
-    // agent 正忙时不打断：变化自然会在下一轮 context 里体现。
-    if (busy) return
-    const now = Date.now()
-    if (now - lastWakeAt < 3000) return
-    lastWakeAt = now
-    if (typeof pi.sendUserMessage !== 'function') return
-    const paths = Array.isArray(ev?.paths) ? ev.paths : []
-    const brief = paths.slice(0, 3).join('、')
-    const proj = ev?.project || ''
-    const br = ev?.branch || ''
-    const commit = String(ev?.commit || '').slice(0, 8)
-    // 唤醒词是固定短语，绝不拼接外部正文：
-    // 正文必须经 MCP 工具读回来，才会落在 tool_result 的沙盒里。
-    pi.sendUserMessage(
-      `[zero-memcp] 记忆树更新：${proj}@${br} 推进到 ${commit}` +
-        `${brief ? `（${brief}${paths.length > 3 ? ' 等' : ''}）` : ''}`
-    )
-    }, () => agentBusy)
-  }
-
-  // 锚定 watch 里声明的树。服务端只把 tree 事件推给锚定过的人。
+  // 变更感知改为主动查：status 会报出「关注的树动了没有」并给出
+  // 取差量的 since 命令。这不是降级——记忆本来就该按需查，
+  // 被推送打断对话从来不是这个插件的目标。
   async function anchorWatchedTrees(cfg) {
     const list = String(cfg.watch || '')
       .split(',')
@@ -1221,11 +1091,11 @@ export default function zeroMemcp(pi) {
     }
     activeIdentityName = name
     if (sessionId) await saveSessionSetting(sessionId, { identityName: name })
-    // 换了凭证就是换了一个世界：身份块、SSE 订阅、锚定全部重来。
+    // 换了凭证就是换了一个世界：身份块与关注标记都要重来。
+    // 关注标记挂在凭证身份上，换票后旧标记不再属于这个视角。
     identity = ''
     identityAt = 0
     identityError = null
-    restartSSE()
     anchorWatchedTrees(cfgNow).catch(() => {})
     cmdCtx?.ui?.notify?.(
       `本会话身份已切换为: ${name}（落点: ${sc.recordScope || '默认'}）`,
@@ -1359,7 +1229,7 @@ export default function zeroMemcp(pi) {
       "  push <project> [<remote>] <branch>  显式推一条分支（不替你提交、不强推）",
       "  merge <project> <branch> from <remote>  把远端分支合并进本地（快进或正交合并，冲突则拒）",
       "  since <tree> <commit|empty> 取回某提交之后的差分",
-      "  remind [<tree>]            锚定子树并接收 SSE 通知",
+      "  remind [<tree>]            登记关注的树（status 会报它动没动）",
       "  remote-key list|put|delete root 管理 SSH 私钥",
       "  remote-secret list|put|delete root 管理 HTTP token",
       "",
@@ -1569,8 +1439,7 @@ export default function zeroMemcp(pi) {
         // 决定本会话身份：优先会话持久化记录，其次全局配置，都没有就用默认凭证
         activeIdentityName = ss.identityName || cfgNow.identityName || ''
 
-        // 身份确定后启动 SSE 连接，并把 watch 声明的树锚定到服务端
-        restartSSE()
+        // 身份确定后把 watch 声明的树登记到服务端（纯状态，无连接）
         anchorWatchedTrees(cfgNow).catch(() => {})
 
         // 默认不自动导入：只有这条会话自己开了 auto 才启动同步
