@@ -1484,6 +1484,27 @@ export default function zeroMemcp(pi) {
             docs === null ? null : `已索引切片: ${docs} 篇`,
           ].filter(Boolean)
 
+          // 服务端的 status 必须一并带上。
+          //
+          // 早先这个本地分支直接 return，把服务端 status 整个挡住了——
+          // 于是「语义后端是否降级」「同步上次成功是什么时候」「有没有
+          // 待决议冲突」三件事，在任何客户端里都看不到。它们恰好都是
+          // 静默失败：召回变差、记忆没到另一台机器，都不报错。
+          //
+          // 合并输出而不是让用户敲两条：这两半描述的是同一个系统的状态，
+          // 分开看只会让人以为它们是两回事。
+          if (reachable) {
+            try {
+              const remoteStatus = await term(cfg, 'status', 3000)
+              const extra = String(remoteStatus || '')
+                .split('\n')
+                .filter((l) => l.trim() && !l.startsWith('docs:'))
+              if (extra.length) lines.push(...extra)
+            } catch (e) {
+              lines.push(`服务端状态不可用: ${e}`)
+            }
+          }
+
           return { content: [{ type: "text", text: lines.join("\n") }] }
         }
       }
