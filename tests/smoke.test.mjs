@@ -158,12 +158,19 @@ test('源码里不存在命令作用域内的裸 ctx 引用', () => {
   assert.deepEqual(offenders, [], `命令作用域里出现裸 ctx：\n${offenders.join('\n')}`)
 })
 
-test('不再有自定义 SSE 通道（服务端只讲 MCP）', () => {
-  // 这条是反向断言：SSE 订阅/推送已整体移除，防止有人把长连接加回来。
-  // 服务端对外只有一个 /mcp 入口，多一条通道就是多一套要维护的传输。
-  assert.doesNotMatch(src, /startSSEListener/, '不应再有 SSE 监听器')
-  assert.doesNotMatch(src, /text\/event-stream/, '不应再消费事件流')
-  assert.doesNotMatch(src, /\/events/, '不应再连 /events')
+test('事件流只走 /mcp 的标准订阅，不再有自定义端点', () => {
+  // 事件流本身是合法的：subscriptions/listen 的响应体就是 SSE。
+  // 要禁止的是**第二套通道**——自定义 /events 端点 + 自定义事件名。
+  assert.doesNotMatch(src, /\/events/, '不应再连自定义 /events 端点')
+  assert.doesNotMatch(src, /startSSEListener/, '不应有自建的 SSE 监听器')
+  // 订阅必须是标准方法名
+  assert.match(src, /subscriptions\/listen/, '应使用标准 subscriptions/listen')
+  assert.match(src, /notifications\/resources\/updated|parseFrame/, '应解析标准资源变更通知')
+})
+
+test('唤醒策略默认关闭，且任何一种模式都要显式配置', () => {
+  // 默认 off：装上就在后台唤醒 agent 是不可接受的默认值。
+  assert.match(src, /mode: 'off'/, 'wake.mode 默认应为 off')
 })
 
 test('去重键用全文哈希而不是前缀截断', () => {

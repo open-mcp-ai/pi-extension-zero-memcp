@@ -144,6 +144,22 @@ const DEFAULTS = {
   // 一个身份一张凭证。服务端签发时就把能力与挂载范围写死了，
   // 这里只是把它们收在一处，方便按名字切换。
   tokens: {},
+  // 资源变更唤醒策略。
+  //
+  //   mode: off | notify | continue | loop
+  //     off      不订阅，不唤醒（默认）
+  //     notify   只累积；下一轮 context 注入一行提示，零额外 token
+  //     continue 空闲时唤醒一轮，忽略自己写的（origin 过滤）
+  //     loop     不过滤 origin —— 允许自激。必须配 maxChain 熔断
+  //
+  // cooldownMs 是两次唤醒之间的最小间隔；maxChain 是连续唤醒上限，
+  // 达到即停（无人值守时防止无限烧 token）。loop 模式下链长跨轮累积。
+  wake: {
+    mode: 'off',
+    cooldownMs: 60000,
+    maxChain: 0,
+  },
+
   // 启动时自动登记的关注树：逗号分隔，例如 "daily@zero,notes@zero/team"。
   //
   // 它只影响一件事：`mem status` 会报出这些树「动了没有」。
@@ -610,6 +626,15 @@ function isSubagent(ctx) {
  *
  * 服务端的 /mcp 接口不接受 profile 参数；权限与视角完全来自 Bearer Token。
  */
+// termSession 由扩展工厂在会话启动时设置，供模块级 term() 读取。
+// 不放在闭包里是因为 term 是模块级函数（bin/ 的脚本也用它）。
+let termSession = ''
+
+/** 设置当前会话标识（扩展工厂在 session_start 时调用）。 */
+export function setTermSession(tag) {
+  termSession = tag || ''
+}
+
 async function term(cfg, cmd, timeoutMs = 5000, vars = {}, args = []) {
   const rpcArgs = { cmd }
   if (vars && Object.keys(vars).length) rpcArgs.vars = vars
@@ -617,7 +642,12 @@ async function term(cfg, cmd, timeoutMs = 5000, vars = {}, args = []) {
 
   const res = await fetch(`${cfg.endpoint}/mcp`, {
     method: 'POST',
-    headers: authHeaders(cfg, { 'content-type': 'application/json' }),
+    headers: authHeaders(cfg, {
+      'content-type': 'application/json',
+      // 会话标识：服务端把它写进资源变更事件的 origin 里，
+      // 客户端据此判断「这次变更是不是我自己造成的」。
+      ...(termSession ? { 'X-Memcp-Session': termSession } : {}),
+    }),
     body: JSON.stringify({
       jsonrpc: '2.0',
       id: Date.now(),
@@ -820,6 +850,7 @@ function renderHits(hits) {
 // 与新对话就变成两个语料库——同一个 recall 里它们的 docLen、字段、
 // 甚至能否被 parseSliceMeta 识别都会不一致。一条规则只应存在一处。
 import { chunkThinking, renderThought } from './bin/layer-import-lib.js'
+import { WakePolicy, makeSessionTag, parseFrame, renderPending } from './bin/wake.js'
 
 export default function zeroMemcp(pi) {
   let cfgPromise = loadConfig()
@@ -913,15 +944,20 @@ export default function zeroMemcp(pi) {
     turnUserText = ''
   }
 
-  // 关注标记：启动时把 config.watch 声明的树登记到服务端。
+  // ── 资源变更订阅与唤醒 ────────────────────────────────────
   //
-  // 这里不再有长连接、不再有推送。原先那套 SSE 订阅已移除——它自造了
-  // 一条协议（自定义 event 名、自定义帧、自定义鉴权语义），而服务端
-  // 对外承诺的只有 MCP。少一条通道就少一套要维护的传输。
+  // zero-memcp 用标准 MCP 的 subscriptions/listen 推送「记忆树变了」。
+  // 这里是客户端侧：开流、解析、按策略决定要不要让 agent 知道。
   //
-  // 变更感知改为主动查：status 会报出「关注的树动了没有」并给出
-  // 取差量的 since 命令。这不是降级——记忆本来就该按需查，
-  // 被推送打断对话从来不是这个插件的目标。
+  // 策略必须显式（见 bin/wake.js）：写入会推进分支头，推进会产生事件，
+  // 事件会唤醒写入者。默认当 bug 处理（过滤自己），但 loop 模式下
+  // 它是**特性**——写一条 TODO 就继续干活，直到 maxChain 熔断。
+
+  let sessionTag = ''
+  let stopListen = null
+  let wakePolicy = new WakePolicy({ mode: 'off' })
+
+  // 关注标记同时用于 status 与订阅 URI 构造。
   async function anchorWatchedTrees(cfg) {
     const list = String(cfg.watch || '')
       .split(',')
@@ -935,6 +971,133 @@ export default function zeroMemcp(pi) {
         pi.events?.emit?.('zero-memcp:anchor-error', { addr, message: String(err) })
       }
     }
+  }
+
+  /** 把 project@branch[/path] 转成 memcp:// 资源 URI。 */
+  function toResourceURI(addr) {
+    const at = addr.indexOf('@')
+    if (at < 0) return ''
+    const project = addr.slice(0, at)
+    let rest = addr.slice(at + 1)
+    // branch[:/]path → branch/path
+    rest = rest.replace(':', '/').replace(/\/+$/, '')
+    return `memcp://${project}/${rest}`
+  }
+
+  /**
+   * 打开 subscriptions/listen 事件流。
+   *
+   * 用 fetch 直接开：扩展本来就是自己发 MCP 请求的（term 就是这么做的），
+   * 不需要经过 Pi 的 MCP 适配器——那条路径的 notification 只转给 UI。
+   */
+  function startListen(cfg) {
+    stopListen?.()
+    stopListen = null
+    if (!cfg.enabled) return
+    const mode = cfg.wake?.mode || 'off'
+    if (mode === 'off') return
+
+    const uris = String(cfg.watch || '')
+      .split(',')
+      .map((x) => x.trim())
+      .filter(Boolean)
+      .map(toResourceURI)
+      .filter(Boolean)
+    if (!uris.length) {
+      pi.events?.emit?.('zero-memcp:wake-error', {
+        message: 'wake mode is on but config.watch is empty: no tree will ever notify',
+      })
+      return
+    }
+
+    let closed = false
+    let abortCtrl = null
+    let retryDelay = 2000
+
+    const connect = async () => {
+      if (closed) return
+      abortCtrl = new AbortController()
+      try {
+        const res = await fetch(`${cfg.endpoint}/mcp`, {
+          method: 'POST',
+          headers: authHeaders(cfg, {
+            'content-type': 'application/json',
+            Accept: 'text/event-stream',
+            'X-Memcp-Session': sessionTag,
+          }),
+          body: JSON.stringify({
+            jsonrpc: '2.0',
+            id: `listen-${sessionTag}`,
+            method: 'subscriptions/listen',
+            params: { notifications: { resourceSubscriptions: uris } },
+          }),
+          signal: abortCtrl.signal,
+        })
+        if (!res.ok) throw new Error(`listen ${res.status}`)
+        retryDelay = 2000
+
+        const reader = res.body.getReader()
+        const decoder = new TextDecoder()
+        let buf = ''
+        for (;;) {
+          const { value, done } = await reader.read()
+          if (done) break
+          buf += decoder.decode(value, { stream: true })
+          const parts = buf.split('\n\n')
+          buf = parts.pop()
+          for (const part of parts) {
+            const { events } = parseFrame(part + '\n\n')
+            if (!events.length) continue
+            handleResourceEvents(cfg, events)
+          }
+        }
+      } catch (err) {
+        if (err && err.name === 'AbortError') return
+        if (process.env.ZERO_MEMCP_DEBUG) {
+          process.stderr.write(`[zero-memcp] listen 断开: ${err}\n`)
+        }
+      }
+      if (!closed && abortCtrl && !abortCtrl.signal.aborted) {
+        // 抖动：服务端重启时所有会话会在同一毫秒重连。
+        const jitter = retryDelay * 0.25 * (Math.random() * 2 - 1)
+        setTimeout(connect, Math.max(500, Math.round(retryDelay + jitter)))
+        retryDelay = Math.min(retryDelay * 2, 60000)
+      }
+    }
+
+    connect()
+    stopListen = () => {
+      closed = true
+      try { abortCtrl?.abort() } catch {}
+    }
+  }
+
+  /** 按策略处理一批资源变更。 */
+  function handleResourceEvents(cfg, events) {
+    const action = wakePolicy.handle(events)
+    pi.events?.emit?.('zero-memcp:wake-decision', {
+      action: action.action, reason: action.reason, count: action.events.length,
+    })
+
+    if (action.action === 'notify') return // 等下一轮 context 提示
+
+    if (action.action === 'stopped') {
+      pi.events?.emit?.('zero-memcp:wake-stopped', { reason: action.reason })
+      return
+    }
+
+    if (action.action !== 'wake') return
+
+    const uris = [...new Set(action.events.map((e) => e.uri))]
+      .map((u) => u.replace(/^memcp:\/\//, '').replace('/', '@'))
+    const brief = uris.slice(0, 3).join('、') + (uris.length > 3 ? ' 等' : '')
+
+    if (typeof pi.sendUserMessage !== 'function') return
+    // 唤醒词是固定短语，绝不拼接外部正文：正文必须经 mem 工具读回，
+    // 才会落在 tool_result 的沙盒里。
+    pi.sendUserMessage(
+      `[zero-memcp] 记忆树更新：${brief}。用 mem 工具取差量（since <tree> <commit>）。`,
+    )
   }
 
   // 记忆入口工具。
@@ -1029,6 +1192,81 @@ export default function zeroMemcp(pi) {
       if (!sessionId) sessionId = deriveSessionId(cmdCtx, skip)
       if (sessionId) await saveSessionSetting(sessionId, { importMode: target })
       cmdCtx?.ui?.notify?.(`本会话记录模式已设为: ${show(target)}`, 'info')
+    },
+  })
+
+  pi.registerCommand('mem:wake', {
+    description: '资源变更唤醒：/mem:wake [off|notify|continue|loop] [global] | reset | 空参看状态',
+    handler: async (args, cmdCtx) => {
+      const cfg = await cfgPromise
+      const raw = String(args || '').trim()
+      const parts = raw ? raw.split(/\s+/) : []
+      const val = s => (s === 'on' ? 'continue' : s)
+
+      // 空参：报状态
+      if (!parts.length) {
+        const st = wakePolicy.status()
+        const watchList = String(cfg.watch || '').split(',').map(x => x.trim()).filter(Boolean)
+        const lines = [
+          `模式: ${st.mode}`,
+          `冷却: ${Math.round(st.cooldownMs / 1000)}s`,
+          `熔断: ${st.maxChain > 0 ? `${st.chain}/${st.maxChain} 次` : '不限'}`,
+          `待提示: ${st.pending} 条`,
+          `观测树: ${watchList.length ? watchList.join(', ') : '（watch 为空，不会收到事件）'}`,
+          '',
+          '模式说明:',
+          '  off       不订阅，不唤醒',
+          '  notify    只累积提示，下一轮对话时注入（零额外 token）',
+          '  continue  空闲时唤醒一轮，忽略自己写的',
+          '  loop      允许自激（自己写的也唤醒），必须配 maxChain',
+          '',
+          '用法: /mem:wake notify | /mem:wake loop global | /mem:wake reset',
+        ]
+        if (!watchList.length && st.mode !== 'off') {
+          lines.push('', '⚠ watch 为空：当前配置收不到任何事件，请先设置 watch')
+        }
+        cmdCtx?.ui?.notify?.(lines.join('\n'), 'info')
+        return
+      }
+
+      if (parts[0] === 'reset') {
+        wakePolicy.reset()
+        cmdCtx?.ui?.notify?.('已复位唤醒熔断计数', 'info')
+        return
+      }
+
+      const mode = val(parts[0])
+      if (!['off', 'notify', 'continue', 'loop'].includes(mode)) {
+        cmdCtx?.ui?.notify?.(`未知模式 "${parts[0]}"，支持 off / notify / continue / loop`, 'warning')
+        return
+      }
+      const isGlobal = parts.includes('global')
+
+      if (isGlobal) {
+        try {
+          await saveGlobalConfig({ wake: { ...(cfg.wake || {}), mode } })
+          cfg.wake = { ...(cfg.wake || {}), mode }
+        } catch (err) {
+          cmdCtx?.ui?.notify?.(String(err), 'error')
+          return
+        }
+        wakePolicy.configure({ mode })
+        startListen(cfg)
+        cmdCtx?.ui?.notify?.(`全局唤醒模式已改为: ${mode}`, 'info')
+        return
+      }
+
+      wakePolicy.configure({ mode })
+      startListen(cfg)
+      if (mode === 'loop') {
+        cmdCtx?.ui?.notify?.(
+          'loop 模式已开启：自己写的记忆也会唤醒自己。\n' +
+            `熔断: ${wakePolicy.maxChain > 0 ? wakePolicy.maxChain + ' 次' : '当前不限（建议在 config 里设 maxChain）'}`,
+          'warning',
+        )
+      } else {
+        cmdCtx?.ui?.notify?.(`本会话唤醒模式已改为: ${mode}`, 'info')
+      }
     },
   })
 
@@ -1439,8 +1677,23 @@ export default function zeroMemcp(pi) {
         // 决定本会话身份：优先会话持久化记录，其次全局配置，都没有就用默认凭证
         activeIdentityName = ss.identityName || cfgNow.identityName || ''
 
-        // 身份确定后把 watch 声明的树登记到服务端（纯状态，无连接）
+        // 身份确定后把 watch 声明的树登记到服务端（供 status 用）
         anchorWatchedTrees(cfgNow).catch(() => {})
+
+        // 资源变更订阅：每个会话一个 sessionTag，事件据此区分
+        // 「我自己写的」和「别人写的」。
+        if (!sessionTag) {
+          sessionTag = makeSessionTag()
+          setTermSession(sessionTag)
+        }
+        wakePolicy.configure({
+          mode: cfgNow.wake?.mode || 'off',
+          cooldownMs: cfgNow.wake?.cooldownMs,
+          maxChain: cfgNow.wake?.maxChain,
+          session: sessionTag,
+          identity: activeIdentityName,
+        })
+        startListen(cfgNow)
 
         // 默认不自动导入：只有这条会话自己开了 auto 才启动同步
         if (cfgNow.syncSessionOnStart && sessionImportMode === 'auto') {
@@ -1790,6 +2043,8 @@ export default function zeroMemcp(pi) {
 
   // 主写入点。messages 是权威来源，不依赖累积状态。
   pi.on('agent_end', async (event) => {
+    // 一轮结束：非 loop 模式的连续计数在此归零。
+    wakePolicy.onTurnEnd()
     if (abortedTurn) {
       abortedTurn = false
       pendingAnswer = ''
@@ -1886,6 +2141,10 @@ export default function zeroMemcp(pi) {
 
   // 会话关闭前最后兜一次，避免最后一句没写完就断了。
   pi.on('session_shutdown', async () => {
+    // 先断订阅再冲刷：否则冲刷产生的写入会推进分支头，
+    // 在退出过程中再触发一次唤醒。
+    try { stopListen?.() } catch {}
+    stopListen = null
     await flush('session_shutdown', null)
   })
 
@@ -1929,6 +2188,14 @@ export default function zeroMemcp(pi) {
 
     const text = latestUserText(event.messages)
     const extra = []
+
+    // notify 模式的提示：只报地址，不报正文。
+    // 取走即清空——同一批变化不该反复出现在每一轮上下文里。
+    const pendingUpdates = wakePolicy.takePending()
+    if (pendingUpdates.length) {
+      const rendered = renderPending(pendingUpdates)
+      if (rendered) extra.push(rendered)
+    }
 
     // 重连检测：上一轮不可达、这一轮可达 = 服务回来了。
     // auto 模式下，断网期间落下的问答现在补上。

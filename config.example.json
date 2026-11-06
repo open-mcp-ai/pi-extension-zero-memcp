@@ -1,23 +1,17 @@
 {
   "endpoint": "http://127.0.0.1:1729",
   "enabled": true,
-
   "importMode": "off",
   "syncSessionOnStart": false,
-
   "recallLimit": 3,
   "recallTimeoutMs": 200,
   "recallLayerTimeoutMs": 2000,
-
   "identity": "off",
   "identityName": "",
   "identityTtlMs": 3600000,
-
   "token": "",
   "tokens": {},
-
   "watch": "",
-
   "_comment_scopes": [
     "分层记忆：读的时候按可信度分三层，写的时候也必须分层——",
     "否则这套分层只对历史数据成立，新对话立刻退化成一锅粥。",
@@ -34,7 +28,6 @@
   "recordScope": "",
   "factScope": "",
   "thoughtScope": "",
-
   "_comment_personas": [
     "人格 → 记忆落点的映射。一个身份一张凭证，每张凭证有自己的挂载表。",
     "personas 声明的 scope 必须落在对应凭证的挂载范围内，",
@@ -53,5 +46,25 @@
     "    }",
     "  }"
   ],
-  "personas": {}
+  "personas": {},
+  "wake": {
+    "mode": "off",
+    "cooldownMs": 60000,
+    "maxChain": 0
+  },
+  "_comment_wake": [
+    "资源变更唤醒（MCP subscriptions/listen 标准事件）。",
+    "",
+    "  mode: off | notify | continue | loop",
+    "    off      不订阅，不唤醒（默认）",
+    "    notify   只累积；下一轮对话时注入一行提示，零额外 token",
+    "    continue 空闲时唤醒一轮，忽略自己写的（origin 过滤）",
+    "    loop     不过滤 origin —— 允许自激。必须配 maxChain 熔断",
+    "",
+    "cooldownMs 两次唤醒最小间隔；maxChain 连续唤醒上限（0=不限）。",
+    "loop 模式下链长跨轮累积，达到 maxChain 自动停。",
+    "",
+    "注意：mode 不是 off 但 watch 为空 = 收不到任何事件。",
+    "自激循环（loop）会持续烧 token，无人值守时必须设 maxChain。"
+  ]
 }
