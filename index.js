@@ -850,7 +850,7 @@ function renderHits(hits) {
 // 与新对话就变成两个语料库——同一个 recall 里它们的 docLen、字段、
 // 甚至能否被 parseSliceMeta 识别都会不一致。一条规则只应存在一处。
 import { chunkThinking, renderThought } from './bin/layer-import-lib.js'
-import { WakePolicy, makeSessionTag, parseFrame, renderPending } from './bin/wake.js'
+import { WakePolicy, makeSessionTag, parseFrame, renderPending, renderWakePrompt } from './bin/wake.js'
 
 export default function zeroMemcp(pi) {
   let cfgPromise = loadConfig()
@@ -957,6 +957,11 @@ export default function zeroMemcp(pi) {
   let stopListen = null
   let wakePolicy = new WakePolicy({ mode: 'off' })
 
+  // 唤醒路径的调试输出。默认静默：正常运行时不该有噪音。
+  const wakeDbg = (m) => {
+    if (process.env.ZERO_MEMCP_DEBUG) process.stderr.write(`[zero-memcp:wake] ${m}\n`)
+  }
+
   // 关注标记同时用于 status 与订阅 URI 构造。
   async function anchorWatchedTrees(cfg) {
     const list = String(cfg.watch || '')
@@ -973,7 +978,13 @@ export default function zeroMemcp(pi) {
     }
   }
 
-  /** 把 project@branch[/path] 转成 memcp:// 资源 URI。 */
+  /**
+   * 把 project@branch[/path] 转成 memcp:// 资源 URI。
+   *
+   * 项目名必须 percent-encode：它本身含斜杠（"BlackEggAI/zero"），
+   * 而 URI 用斜杠当分隔符。不转义会解析成 project="BlackEggAI"
+   * branch="zero" path="main.record"，服务端直接 403。
+   */
   function toResourceURI(addr) {
     const at = addr.indexOf('@')
     if (at < 0) return ''
@@ -981,7 +992,10 @@ export default function zeroMemcp(pi) {
     let rest = addr.slice(at + 1)
     // branch[:/]path → branch/path
     rest = rest.replace(':', '/').replace(/\/+$/, '')
-    return `memcp://${project}/${rest}`
+    const slash = rest.indexOf('/')
+    const branch = slash < 0 ? rest : rest.slice(0, slash)
+    const tail = slash < 0 ? '' : rest.slice(slash)
+    return `memcp://${encodeURIComponent(project)}/${encodeURIComponent(branch)}${tail}`
   }
 
   /**
@@ -992,6 +1006,7 @@ export default function zeroMemcp(pi) {
    */
   function startListen(cfg) {
     stopListen?.()
+    wakeDbg(`startListen mode=${cfg.wake?.mode} watch=${JSON.stringify(cfg.watch)}`)
     stopListen = null
     if (!cfg.enabled) return
     const mode = cfg.wake?.mode || 'off'
@@ -1072,32 +1087,41 @@ export default function zeroMemcp(pi) {
     }
   }
 
-  /** 按策略处理一批资源变更。 */
+  /**
+   * 事件到达：只设 flag，绝不在这里唤醒。
+   *
+   * agent 正忙时它这一轮自己会看到提示；已停稳时由 settleWake 拉起。
+   * 「一个事件一次唤醒」是自激的根源，这里从机制上排除了它。
+   */
   function handleResourceEvents(cfg, events) {
-    const action = wakePolicy.handle(events)
-    pi.events?.emit?.('zero-memcp:wake-decision', {
-      action: action.action, reason: action.reason, count: action.events.length,
-    })
+    const r = wakePolicy.ingest(events)
+    wakeDbg(`ingest queued=${r.queued} ignored=${r.ignored} backlog=${r.backlogSize} busy=${wakePolicy.status().busy}`)
+    pi.events?.emit?.('zero-memcp:wake-ingest', r)
+    if (!r.queued) return
+    // 空闲时立刻结算一次；忙时什么都不做，等 agent_settled。
+    if (!wakePolicy.status().busy) settleWake(cfg)
+  }
 
-    if (action.action === 'notify') return // 等下一轮 context 提示
+  /**
+   * 结算：停稳且有积压时拉起一次，一次消费全部积压。
+   *
+   * 两个调用点：事件到达且空闲、agent_settled。
+   */
+  function settleWake(cfg) {
+    const d = wakePolicy.settle()
+    wakeDbg(`settle → ${d.action} (${d.reason}) events=${d.events.length}`)
+    pi.events?.emit?.('zero-memcp:wake-settle', { action: d.action, reason: d.reason, count: d.events.length })
 
-    if (action.action === 'stopped') {
-      pi.events?.emit?.('zero-memcp:wake-stopped', { reason: action.reason })
+    if (d.action === 'stopped') {
+      pi.events?.emit?.('zero-memcp:wake-stopped', { reason: d.reason })
       return
     }
-
-    if (action.action !== 'wake') return
-
-    const uris = [...new Set(action.events.map((e) => e.uri))]
-      .map((u) => u.replace(/^memcp:\/\//, '').replace('/', '@'))
-    const brief = uris.slice(0, 3).join('、') + (uris.length > 3 ? ' 等' : '')
-
+    if (d.action !== 'wake') return
     if (typeof pi.sendUserMessage !== 'function') return
-    // 唤醒词是固定短语，绝不拼接外部正文：正文必须经 mem 工具读回，
-    // 才会落在 tool_result 的沙盒里。
-    pi.sendUserMessage(
-      `[zero-memcp] 记忆树更新：${brief}。用 mem 工具取差量（since <tree> <commit>）。`,
-    )
+
+    // 唤醒词只含地址与 since 命令：正文必须经 mem 工具读回，
+    // 才会落进 tool_result 的沙盒。
+    pi.sendUserMessage(renderWakePrompt(d.events))
   }
 
   // 记忆入口工具。
@@ -1720,7 +1744,10 @@ export default function zeroMemcp(pi) {
   // 「这一轮用户问了什么、我最终答了什么」，不依赖任何逐条累积的状态。
   //
   // 踩过的坑（都是静默失败，不报错，只是永远没写下来）：
-  //   · agent_settled —— 事件里只有 { type, aborted }，拿不到内容，而且这套 pi 上不触发
+  //   · agent_settled —— 事件体只有 { type }，拿不到内容。但它**确实触发**
+  //     （实测序列 agent_start → turn_end → agent_end → agent_before_settle
+  //     → agent_settled），只是不含 messages。所以它适合当「停稳」信号，
+  //     不能当写入点——唤醒就挂在它上面。
   //   · parentSession —— 主会话续接历史也带它，被误判成子会话后 skip=true 全程拦掉
   //   · tool_use / tool_call —— pi 实际用驼峰 toolCall，导致"带工具的最终回复"全被误杀
   //
@@ -2016,6 +2043,8 @@ export default function zeroMemcp(pi) {
     turnUserText = ''
     pendingAnswer = ''
     abortedTurn = false
+    // 忙了：此期间到达的事件只进积压，不唤醒。
+    wakePolicy.markBusy()
   })
 
   pi.on('message_end', async (event) => {
@@ -2140,6 +2169,17 @@ export default function zeroMemcp(pi) {
   })
 
   // 会话关闭前最后兜一次，避免最后一句没写完就断了。
+  // agent 完全停稳（无重试、无压缩、无排队继续）——这是唯一该唤醒的时刻。
+  //
+  // 用 agent_settled 而不是 agent_end：后者之后还可能有自动重试、
+  // 压缩、排队继续，那时拉起会打断本要继续的工作。
+  pi.on('agent_settled', async () => {
+    wakePolicy.markIdle()
+    const cfgNow = await cfgPromise
+    if (!cfgNow.enabled) return
+    settleWake(cfgNow)
+  })
+
   pi.on('session_shutdown', async () => {
     // 先断订阅再冲刷：否则冲刷产生的写入会推进分支头，
     // 在退出过程中再触发一次唤醒。
@@ -2191,7 +2231,11 @@ export default function zeroMemcp(pi) {
 
     // notify 模式的提示：只报地址，不报正文。
     // 取走即清空——同一批变化不该反复出现在每一轮上下文里。
-    const pendingUpdates = wakePolicy.takePending()
+    //
+    // 只有 notify 模式才能 consume：其它模式的积压要留到 agent_settled
+    // 由 settleWake 结算。早先这里无条件取走，导致 continue 模式的 flag
+    // 在停稳之前就被清空，唤醒永远不发生（实测 backlog=1 → settle 时 0）。
+    const pendingUpdates = wakePolicy.mode === 'notify' ? wakePolicy.consume() : []
     if (pendingUpdates.length) {
       const rendered = renderPending(pendingUpdates)
       if (rendered) extra.push(rendered)
