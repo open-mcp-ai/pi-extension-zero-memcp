@@ -439,7 +439,7 @@ async function main() {
       }
 
       try {
-        await callTerm(`put @${t.session} -- $TEXT`, { TEXT: text })
+        await callTerm(`put --session ${t.session} $TEXT`, { TEXT: text })
         written.add(fp)
         result.written++
         pendingCommit++

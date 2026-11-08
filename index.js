@@ -691,13 +691,14 @@ async function putRecord(cfg, text, session, target) {
   // 而 put 的会话识别要求 token 以 "@" 开头且不含 "/"，因此没被识别，
   // 结果是目录里多出一层 "@<uuid>"，且面板上无法按会话分组。
   // 用数组 join 拼，从形状上杜绝这类漏空格。
+  // 语法是 termcp 原生的：正文只能是一个变量引用，绝不能拼进 cmd。
+  // 会话走 --session flag（位置形式的 @<id> 是她上一版的自造语法，
+  // 与 termcp 的 payload 规则冲突：位置参数和引用不能挤在同一个 span）。
   const parts = ['put']
   if (target) parts.push(`${target}/`)
-  if (session) parts.push(`@${session}`)
-  parts.push('--', '$TEXT')
+  if (session) parts.push('--session', session)
+  parts.push('$TEXT')
 
-  // put 的 kind 由落点项目的写入策略决定；插件不再发旧版 note kind。
-  // 服务端命令为 put [<tree>] -- $TEXT，正文走 vars，不参与 DSL 切分。
   return term(cfg, parts.join(' '), 8000, { TEXT: body })
 }
 
@@ -1467,8 +1468,8 @@ export default function zeroMemcp(pi) {
       "  status                     索引规模、语义后端、同步状态",
       "",
       "写：",
-      "  put [<tree>] -- $TEXT      写入记忆（正文通过 vars/args 传，不拼进 cmd）",
-      "  put <tree> --ref <addr>    在树中追加已有记忆的引用（不复制正文）",
+      "  put [<tree>] $TEXT        写入记忆（正文是一个变量引用，绝不拼进 cmd）",
+      "  ref <tree> <addr>          在树中追加已有记忆的引用（不复制正文）",
       "  write <p>@<br>/<path> -- T 精确写入指定路径（规则库用；需 root）",
       "  batch {\"ops\":[...]}       原子批量（多步合成一次提交）",
       "",
@@ -1506,7 +1507,7 @@ export default function zeroMemcp(pi) {
       "  identity [<name>] [global] 查看身份或换一张凭证",
       "",
       "put 入脏层后立即返回；折叠为 Git 提交由显式 commit 或服务端后台策略决定。",
-      "正文必须通过 vars/args 传递，例如 cmd='put notes -- $TEXT', vars={TEXT:'正文'}。",
+      "正文必须通过 vars/args 传递，例如 cmd='put notes $TEXT', vars={TEXT:'正文'}。",
       "help <verb> 看单个动词细节；help --all 看全部。",
     ].join("\n"),
     parameters: {
@@ -1514,12 +1515,12 @@ export default function zeroMemcp(pi) {
       properties: {
         cmd: {
           type: "string",
-          description: "DSL 命令行，例如 'recall 数据库选型' 或 'put notes -- $TEXT'。正文走 vars/args，引用必须独占一个词。",
+          description: "DSL 命令行，例如 'recall 数据库选型' 或 'put notes $TEXT'。正文走 vars/args，引用必须独占一个词。",
         },
         vars: {
           type: "object",
           additionalProperties: { type: "string" },
-          description: "命名正文参数。cmd 中使用独占词引用，例如 cmd='put -- $TEXT', vars={TEXT:'多行正文'}。",
+          description: "命名正文参数。cmd 中使用独占词引用，例如 cmd='put $TEXT', vars={TEXT:'多行正文'}。",
         },
         args: {
           type: "array",

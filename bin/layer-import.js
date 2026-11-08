@@ -214,7 +214,7 @@ async function main() {
   const putOne = async (target, text, session) => {
     if (opts.dryRun) return
     const s = session ? `@${session.slice(0, 8)} ` : ''
-    await callTerm(`put ${s}${target} -- $BODY`, { BODY: text }, 120000)
+    await callTerm(`put ${s}${target} $BODY`, { BODY: text }, 120000)
   }
 
   // 并发写工作池
