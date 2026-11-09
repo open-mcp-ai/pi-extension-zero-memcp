@@ -702,13 +702,6 @@ async function putRecord(cfg, text, session, target) {
   return term(cfg, parts.join(' '), 8000, { TEXT: body })
 }
 
-/** 当天日期段（YYYY-MM-DD）。用记录自身时间，不用写入时间。 */
-function daySegment(d) {
-  const t = d instanceof Date && !Number.isNaN(d.getTime()) ? d : new Date()
-  const p = (n) => String(n).padStart(2, '0')
-  return `${t.getFullYear()}-${p(t.getMonth() + 1)}-${p(t.getDate())}`
-}
-
 // 最终回复自动落盘：
 //
 // 每轮对话结束时，助手说出口的最终总结自动成为切片写入 daily/。
@@ -1857,19 +1850,21 @@ export default function zeroMemcp(pi) {
     const cfg = await cfgPromise
     if (!cfg.enabled) return false
 
+    // 日期段归服务端：写入时按物理时间落到 <facet>/YYYY-MM-DD/<stamp>.md。
+    // 这里绝不能再拼一次日期——早先两侧各拼一次今天，得到
+    // record/2026-11-04/2026-11-04/… 这种两个一模一样的日期。
     const now = new Date()
-    const day = daySegment(now)
     const sc = scopesFor(cfg)
 
     try {
       // 1) 问答对写进记录层（按当前分身的人格落点）
-      const whereRecord = sc.recordScope ? `${sc.recordScope}/${day}` : ''
+      const whereRecord = sc.recordScope || ''
       await putRecord(cfg, text, sessionId, whereRecord)
 
       // 2) 推理链写进想法层（配置了 thoughtScope 且当前轮有 thinking）
       if (sc.thoughtScope && thinkingText && thinkingText.trim()) {
         const chunks = chunkThinking(thinkingText)
-        const whereThought = `${sc.thoughtScope}/${day}`
+        const whereThought = sc.thoughtScope
         for (let i = 0; i < chunks.length; i++) {
           const body = renderThought(
             { ask: t.q, thinking: chunks[i], at: now },
@@ -1972,7 +1967,7 @@ export default function zeroMemcp(pi) {
       const h8 = checksumOf(text)
 
       try {
-        const where = sc.recordScope ? `${sc.recordScope}/${daySegment(new Date())}` : ''
+        const where = sc.recordScope || ''
         await putRecord(cfg, text, sessionId, where)
         // 只有写成功才推进水位
         await saveWatermark(sessionId, { idx: turnIdx, hash: h8 })
@@ -2018,7 +2013,7 @@ export default function zeroMemcp(pi) {
         if (t.idx <= wm.thinkIdx) continue
         const now = new Date()
         const chunks = chunkThinking(t.think)
-        const whereThought = `${sc.thoughtScope}/${daySegment(now)}`
+        const whereThought = sc.thoughtScope
         let ok = true
         for (let k = 0; k < chunks.length; k++) {
           const body = renderThought({ ask: t.q, thinking: chunks[k], at: now }, sessionId, k + 1, chunks.length)
@@ -2148,7 +2143,6 @@ export default function zeroMemcp(pi) {
     if (!target) return
 
     const at = event?.compactionEntry?.timestamp ? new Date(event.compactionEntry.timestamp) : new Date()
-    const day = daySegment(at)
     const sid = sessionId || 'unknown'
     const tokens = event?.compactionEntry?.tokensBefore || 0
 
@@ -2161,7 +2155,7 @@ export default function zeroMemcp(pi) {
     const frontmatter = fm.join('\n')
 
     try {
-      const where = `${target}/${day}`
+      const where = target
       await putRecord(cfgNow, frontmatter, sid, where)
     } catch (err) {
       // 事实层写入失败不阻断对话，但记事件供排查
