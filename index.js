@@ -1337,8 +1337,8 @@ export default function zeroMemcp(pi) {
           )
           return
         }
-    const sc = scopesFor(cfgNow)
-    const problems = validatePersonaScope(cfgNow, name)
+    const sc = scopesFor(cfg)
+    const problems = validatePersonaScope(cfg, name)
     if (problems.length > 0) {
       cmdCtx?.ui?.notify?.(
         `身份 "${name}" 配置有风险：\n${problems.map((p) => `  - ${p}`).join('\n')}`,
@@ -1352,7 +1352,7 @@ export default function zeroMemcp(pi) {
     identity = ''
     identityAt = 0
     identityError = null
-    anchorWatchedTrees(cfgNow).catch(() => {})
+    anchorWatchedTrees(cfg).catch(() => {})
     cmdCtx?.ui?.notify?.(
       `本会话身份已切换为: ${name}（落点: ${sc.recordScope || '默认'}）`,
       'info',
