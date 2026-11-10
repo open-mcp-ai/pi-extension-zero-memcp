@@ -448,7 +448,19 @@ async function fetchIdentity(cfg) {
   if (!res.ok) throw new Error(`identity ${res.status}`)
   const body = await res.json()
   const blocks = Array.isArray(body.blocks) ? body.blocks : []
-  return blocks.map((b) => b.text).filter(Boolean).join('\n\n')
+
+  // 身份可能是同一个仓库里的多份文档（例：简 = SKILL.md，纬 = me/skills/01-weft/）。
+  // 两份都标了 inject: every_turn，服务端会把它们一起给过来——
+  // 于是模型同时看到「我是简」和「我是纬」，认哪个全凭排序，实测认了纬。
+  //
+  // personas.<name>.identityAddrs 是一个 addr 前缀白名单：给了就只注入命中的块。
+  // 这样切换身份是「选哪份自我描述」，不是「换哪张凭证」——同一张凭证足够。
+  const name = activeIdentityName || cfg.identityName || ''
+  const persona = (cfg.personas && name && cfg.personas[name]) || null
+  const allow = Array.isArray(persona?.identityAddrs) ? persona.identityAddrs.filter(Boolean) : null
+  const picked = allow ? blocks.filter((b) => allow.some((a) => String(b.addr || '').startsWith(a))) : blocks
+  if (allow) dbg('fetch_identity_filter', { persona: name, total: blocks.length, picked: picked.length, addrs: picked.map((b) => b.addr) })
+  return picked.map((b) => b.text).filter(Boolean).join('\n\n')
 }
 
 /** 联想：短超时、失败静默。 */
@@ -2121,6 +2133,19 @@ export default function zeroMemcp(pi) {
     // sessionImportMode 恒为 null，非交互模式整段落盘被静默短路。
     const effectiveMode = sessionImportMode || cfgNow.importMode || 'off'
     if (effectiveMode !== 'auto') {
+      pendingAnswer = ''
+      turnUserText = ''
+      return
+    }
+    // 身份没声明落点 = 这个身份不参与记录。
+    //
+    // 记录落点是身份声明的一部分（scopesFor），不是全局开关：
+    // 简写 chat，纬负责维护记忆体、平时挂起待命——它不该在聊天里留痕。
+    // 没有这条，importMode=auto 会把纬的每一轮也写进默认落点，
+    // 两条人格的记录混在同一条分支上。
+    const scNow = scopesFor(cfgNow)
+    if (!scNow.recordScope) {
+      dbg('agent_end_skip_no_record_scope', { persona: scNow.persona })
       pendingAnswer = ''
       turnUserText = ''
       return
