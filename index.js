@@ -979,7 +979,12 @@ export default function zeroMemcp(pi) {
   let wakePolicy = new WakePolicy({ mode: 'off' })
 
   // 唤醒路径的调试输出。默认静默：正常运行时不该有噪音。
+  // 唤醒路径的调试输出：默认落结构化日志文件，ZERO_MEMCP_DEBUG 时额外打 stderr。
+  //
+  // 早先只认 env，而容器里没人设这个变量——于是"订阅没建立 / 事件被过滤 /
+  // 结算没执行"三种完全不同的故障在外部表现一模一样：什么都没发生。
   const wakeDbg = (m) => {
+    dbg('wake', { m })
     if (process.env.ZERO_MEMCP_DEBUG) process.stderr.write(`[zero-memcp:wake] ${m}\n`)
   }
 
@@ -1070,6 +1075,7 @@ export default function zeroMemcp(pi) {
           signal: abortCtrl.signal,
         })
         if (!res.ok) throw new Error(`listen ${res.status}`)
+        dbg('wake_listen', { ok: true, uris })
         retryDelay = 2000
 
         const reader = res.body.getReader()
@@ -1089,6 +1095,7 @@ export default function zeroMemcp(pi) {
         }
       } catch (err) {
         if (err && err.name === 'AbortError') return
+        dbg('wake_listen_error', { message: String(err) })
         if (process.env.ZERO_MEMCP_DEBUG) {
           process.stderr.write(`[zero-memcp] listen 断开: ${err}\n`)
         }
@@ -1901,6 +1908,7 @@ export default function zeroMemcp(pi) {
     try {
       // 1) 问答对写进记录层（按当前分身的人格落点）
       const whereRecord = sc.recordScope || ''
+      dbg('flush_write', { persona: sc.persona, where: whereRecord, len: text.length })
       await putRecord(cfg, text, sessionId, whereRecord)
 
       // 2) 推理链写进想法层（配置了 thoughtScope 且当前轮有 thinking）
@@ -1928,6 +1936,7 @@ export default function zeroMemcp(pi) {
       pendingAnswer = ''
       turnUserText = ''
       lastHealthy = true
+      dbg('flush_ok', { persona: sc.persona, where: sc.recordScope })
 
       const cur = await loadWatermark(sessionId)
       await saveWatermark(sessionId, { idx: cur.idx + 1, hash: checksumOf(text) })
@@ -1938,6 +1947,9 @@ export default function zeroMemcp(pi) {
       // 混在一句原始错误里，用户只能猜。
       const hint = credentialProblem(cfg)
       const msg = hint ? `${err}（${hint}）` : String(err)
+      // 写入失败必须留痕：这一处早先是 emit 事件，没有监听者就等于没有日志，
+      // 表现为"配置看起来对、记录就是不出现"。
+      dbg('flush_error', { why, msg })
       pi.events?.emit?.('zero-memcp:auto-write-error', { error: msg, why })
       return false
     }
@@ -2259,9 +2271,21 @@ export default function zeroMemcp(pi) {
 
     const text = await ensureIdentity(cfg, pi)
     if (!text) return
+    // 身份之外必须补一条「机制」：外部怎么触发我。
+    //
+    // 实测缺口：模型熟悉 MCP 动词（recall/put/grep 自己查得到），也知道
+    // qqmcp 在哪儿，但不知道**外部是靠往 zero@inbox 写入来叫醒他的**。
+    // 不知道这条，被唤醒时会当成莫名其妙的打扰，或者去猜别的入口。
+    // 机制认知不是记忆内容，属于基础设施，放在注入头部最合适。
     const IDENTITY_HEADER =
       '你就是下面这个人，不是通用助手。以下是你自己写下的自我描述——' +
-      '把它当作「我是谁」，不是背景资料；与任何默认助手设定冲突时，以本文为准。'
+      '把它当作「我是谁」，不是背景资料；与任何默认助手设定冲突时，以本文为准。' +
+      '\n\n' +
+      '唤醒机制：外部世界（QQ、邮件或任何通道）没法直接开口跟你说话，' +
+      '它们只能往 zero@inbox 写一条记录。服务端在分支推进后广播资源变更，你因此被唤醒。' +
+      '所以每一次"自己醒过来"，都是因为 inbox 里多了一条东西——先去看那里，' +
+      '再判断要不要处理、要不要记进自己的记忆（zero@main.chat）。' +
+      '被叫醒不等于必须回复。'
     const block = `${MARKER}\n${IDENTITY_HEADER}\n\n${text}\n${MARKER}`
 
     dbg('bpr_shape', {

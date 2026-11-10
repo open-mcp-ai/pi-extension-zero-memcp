@@ -259,11 +259,19 @@ export function renderWakePrompt(events) {
     const at = ev.commit ? ` @${ev.commit.slice(0, 8)}` : ''
     lines.push(`- ${addr}${at}${from}`)
   }
+  // 事件不再携带 commit：写入即通知，脏层里没有新版本号。
+  //
+  // 早先文案让人 `since <tree> <commit>` 取差量。广播点从 commit 挪到写入后，
+  // 那个 commit 是「写入前的头」——拿它取差量只会得到空。
+  // 正确的动作是直接去看那棵树，所以文案改成让人去读。
   return [
-    '[zero-memcp] 有积压的记忆变更需要处理：',
+    '[zero-memcp] 有新的写入需要处理：',
     ...lines,
     '',
-    '用 mem 工具取差量：mem({ cmd: "since <tree> <commit>" })',
+    '这些树刚被写过（可能还没折叠成提交）。用 mem 工具直接看：',
+    '  mem({ cmd: "ls <日期>" })      看某天有什么',
+    '  mem({ cmd: "grep <关键词> --scope <树>" })',
+    '  mem({ cmd: "recall <问题>" })   语义检索',
     '若这些变更不需要动作，直接回复即可。',
   ].join('\n')
 }

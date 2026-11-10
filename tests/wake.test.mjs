@@ -179,12 +179,14 @@ test('parseFrame 忽略心跳与非 JSON', () => {
   assert.equal(parseFrame(': keepalive\n\ndata: not-json\n\n').events.length, 0)
 })
 
-test('renderWakePrompt 只给地址与 since 命令，不含正文', () => {
+test('renderWakePrompt 只给地址与读取命令，不含正文', () => {
   const s = renderWakePrompt([{ uri: 'memcp://BlackEggAI/zero/main.record', commit: 'abcd1234ef', origin: { identity: 'desktop' } }])
   assert.match(s, /BlackEggAI@zero/)
   assert.match(s, /by desktop/)
   assert.match(s, /abcd1234/)
-  assert.match(s, /since/)
+  // 广播点从 commit 挪到写入后，脏层没有新版本号：取差量已无意义，
+  // 文案改为直接看树。
+  assert.match(s, /mem\(\{ cmd: "ls/)
   assert.doesNotMatch(s, /正文内容/)
 })
 
