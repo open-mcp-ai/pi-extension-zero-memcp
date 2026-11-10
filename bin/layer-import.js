@@ -27,6 +27,7 @@ import {
   renderThought,
   chunkThinking,
   dayStamp,
+  timeStamp,
   LAYERS,
   VERSION,
 } from './layer-import-lib.js'
@@ -36,8 +37,8 @@ function parseArgs(argv) {
     targets: [],
     endpoint: process.env.ZERO_MEMCP_ENDPOINT || 'http://127.0.0.1:1729',
     token: process.env.ZERO_MEMCP_TOKEN || '',
-    project: 'zero-agi',
-    branch: 'zero',
+    project: 'BlackEggAI/weft',
+    branch: 'main.record',
     statePath:
       process.env.ZERO_MEMCP_IMPORT_STATE || join(homedir(), '.zero-memcp', 'layer-import-state.json'),
     useState: true,
@@ -120,7 +121,7 @@ Three branches, one per layer:
   thought thinking chains, chunked at ~4KB (reasoning, high volume)
 
 Query them as a fallback chain so the cheap layer answers first:
-  recall q --scope <project>@fact || recall q --scope <project>@record || recall q --scope <project>@thought
+  recall q --scope <project>@<branch>:fact || recall q --scope <project>@<branch>:record
 
 Usage:
   zero-memcp-layer-import [options] [path...]
@@ -131,8 +132,11 @@ Default: ~/.pi/agent/sessions
 Options:
   --endpoint URL      zero-memcp address (default http://127.0.0.1:1729)
   --token JWT         credential (required when the server enforces auth)
-  --project NAME      target project (default zero-agi)
-  --branch NAME       base branch name (default zero)
+  --project NAME      target project (default BlackEggAI/weft)
+  --branch NAME       target branch/lifeline (default main.record)
+
+Requires a ROOT credential: this tool writes explicit paths via "write"
+(archive placement), not auto-named slices via "put" (live writes).
   --layers a,b,c      import only these layers (default fact,record,thought)
   --limit N           stop after N sessions (debugging)
   --concurrency N     parallel writes in flight (default 6)
@@ -147,8 +151,24 @@ Options:
 `
 }
 
-function targetAddr(project, layer, day) {
-  return `${project}@${layer}/${day}`
+// 生成一条记录的完整写入地址。
+//
+// 历史导入与日常写入的分工不同，所以这里不用 put 而用 write：
+//
+//   put   低权限、自动命名、日期由服务端按「写入时刻」分片 → 适合此刻发生的事
+//   write root、路径由调用方给定                              → 适合把已有档案归位
+//
+// 归档要保留的是**聊天发生的那天**，不是「我今天补进来」的那天。
+// 早先调用方把日期拼进 put 的落点树里，服务端又按写入时刻追加一层，
+// 于是出现 record/2026-10-24/2026-11-03/ 这种两层日期——外层是实录日，
+// 内层是入库日。现在改成：路径只留实录日，入库事实交给 git 提交时间。
+let addrSeq = 0
+function targetAddr(project, branch, layer, day, at) {
+  addrSeq += 1
+  const t = timeStamp(at)                                  // HHMMSS
+  const us = String(at ? at.getMilliseconds() * 1000 : 0).padStart(6, '0')
+  const file = `${t}.${us}-${addrSeq}-import.md`
+  return { addr: `${project}@${branch}:${layer}/${day}/${file}`, path: `${layer}/${day}/${file}` }
 }
 
 async function main() {
@@ -200,21 +220,29 @@ async function main() {
 
   const commitAll = async () => {
     if (opts.dryRun) return
-    for (const layer of opts.layers) {
-      try {
-        await callTerm(`commit ${opts.project}@${layer} -m "import: ${layer}"`, null, 180000)
-        result.committed++
-      } catch (err) {
-        result.errors.push(`commit ${layer}: ${err.message}`)
-      }
+    // 所有 layer 都写在同一个分支上（当前模型：一个人格一条 lifeline，
+    // 认知切面是树而不是分支），所以提交只需要一次。
+    try {
+      await callTerm(
+        `commit ${opts.project}@${opts.branch} -m "import: ${opts.layers.join(',')}"`,
+        null,
+        180000,
+      )
+      result.committed++
+    } catch (err) {
+      result.errors.push(`commit: ${err.message}`)
     }
     pending = 0
   }
 
-  const putOne = async (target, text, session) => {
+  // write 而不是 put：路径完全由这里决定，服务端不再插一层日期。
+  //
+  // 代价是这里必须自己保证文件名唯一（微秒 + 自增序号 + import 标签），
+  // 而且 write 仅限 root —— 归档是人工触发的运维动作，不该由低权限的
+  // 自动写入路径拥有。
+  const writeOne = async (addr, text) => {
     if (opts.dryRun) return
-    const s = session ? `@${session.slice(0, 8)} ` : ''
-    await callTerm(`put ${s}${target} $BODY`, { BODY: text }, 120000)
+    await callTerm(`write ${addr} $BODY`, { BODY: text }, 120000)
   }
 
   // 并发写工作池
@@ -228,7 +256,7 @@ async function main() {
           continue
         }
         try {
-          await putOne(j.target, j.text, j.sessionId)
+          await writeOne(j.target, j.text)
           written.add(j.fp)
           result.written++
           pending++
@@ -268,7 +296,7 @@ async function main() {
         const day = dayStamp(f.at)
         jobs.push({
           layer: 'fact',
-          target: targetAddr(opts.project, 'fact', day),
+          target: targetAddr(opts.project, opts.branch, 'fact', day, f.at).addr,
           text: renderFact(f, s.id),
           fp: contentFingerprint('fact', f.summary),
           sessionId: s.id,
@@ -281,7 +309,7 @@ async function main() {
         const day = dayStamp(r.at)
         jobs.push({
           layer: 'record',
-          target: targetAddr(opts.project, 'record', day),
+          target: targetAddr(opts.project, opts.branch, 'record', day, r.at).addr,
           text: renderRecord(r, s.id),
           fp: contentFingerprint('record', r.ask + '\n' + r.answer),
           sessionId: s.id,
@@ -296,7 +324,7 @@ async function main() {
           const day = dayStamp(t.at)
           jobs.push({
             layer: 'thought',
-            target: targetAddr(opts.project, 'thought', day),
+            target: targetAddr(opts.project, opts.branch, 'thought', day, t.at).addr,
             text: renderThought({ ...t, thinking: chunk }, s.id, i + 1, chunks.length),
             fp: contentFingerprint('thought', chunk),
             sessionId: s.id,
