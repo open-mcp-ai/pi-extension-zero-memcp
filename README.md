@@ -14,6 +14,38 @@
 
 ---
 
+## 30 秒快速上手
+
+### 1. 配置向导
+
+在新机器上安装后，运行向导自动生成 `~/.zero-memcp/config.json`：
+
+```bash
+# 本机模式（连 127.0.0.1:1729）
+npx zero-memcp-init
+
+# 连局域网/网格内的 Hub（例如常开的 3060 主机）
+npx zero-memcp-init -e http://10.10.10.12:1729 -t <your-jwt-token> -i laptop -y
+```
+
+### 2. 一键体检（解决「感觉没生效」的唯一入口）
+
+本插件遵循**静默降级**（失败不破坏正常对话），因此写权限缺失或检索超时不会在屏幕上弹红字。使用 `doctor` 可以直接看到全部证据：
+
+```bash
+npx zero-memcp-doctor
+```
+
+它会逐项检查：
+- 配置文件是否存在、endpoint 是否可达
+- Token 身份是 root 还是受限挂载表
+- **配置声明的 scope 是否被凭证覆盖**（分支写权限缺失是「对话一篇都没记下来」的最常见原因）
+- 读路径（`/recall`）端到端命中数
+
+全部为 `✓` 即表示链路就绪。
+
+---
+
 ## 安装
 
 在 Pi 扩展目录下建软链接：
@@ -244,6 +276,51 @@ mem({ cmd: "recall 数据库选型" })
 - **`off`（缺省）**：只读，不自动写入。每轮可做身份注入和语义联想；
 - **`auto`**：每轮问答结束时由扩展调用 `put` 自动记录问答对；
 - `/mem:sync` 可手动把当前会话完整问答导入记忆库（按水位与内容去重）。
+
+---
+
+## 故障排查：为什么“看起来没生效”
+
+本插件对失败一律**静默降级**：宁可少一次联想，不让记忆服务把对话本身搞坏。这个设计对正在干活的人是合适的，代价是“坏了看不出来”。下表是每一层失败时的**真实表现**与**去哪里看真因**：
+
+| 失败点 | 你看到的现象 | 真因在哪 |
+|---|---|---|
+| 服务端未启动 / 地址错误 | 如常对话，但记忆里什么都没有 | `npx zero-memcp-doctor`；直接 `curl <endpoint>/health` |
+| Token 无效/过期 | 同样如常对话 | doctor 第 3 节会报 401；服务端日志会有被拒记录 |
+| **配置的 scope 不被凭证覆盖** | 如常对话，**但一篇都没记下来** | doctor 第 4 节；服务端日志里的 `missing w permission` |
+| 联想超时（`recallTimeoutMs`） | 上下文里没有记忆卡片 | 调大 `recallTimeoutMs`；或看服务端 `/recall` 耗时 |
+| 磁盘/仓库写失败 | 如常对话，历史不推进 | 服务端日志；`git --git-dir=<repo>.git log` 看提交有没有长 |
+
+**排查顺序建议**：先跑 `zero-memcp-doctor`，它会把上面五类一次性分开。doctor 只读，不写记忆、不动水位（除非显式 `--probe-write`）。
+
+另外：`clock.json` 与水位目录是**全局**的，不区分 endpoint。在“本机备份 ↔ 远程 Hub”之间切换时，doctor 里那个逻辑时钟差值会失真（它会明确报“不可比”），不影响功能。
+
+---
+
+## 多端拓扑：Hub 与 Spoke
+
+多台机器同时用一套记忆时，推荐星型拓扑：**常开的那台做 Hub，其余是 Spoke**。
+
+```toml
+# Spoke 侧的 zero-memcp 配置（每个项目一条）
+[[remote]]
+project    = "BlackEggAI/zero"
+name       = "hub"
+url        = "http://10.10.10.12:1729/repos/BlackEggAI/zero.git?insecure=1"
+push       = ["main", "main.record"]
+auto_sync  = true
+http_user  = "x-access-token"
+http_token = "tok-hub"
+```
+
+三条容易踩的坑：
+
+1. **凭证方向是单向的**：Spoke 推给 Hub，用的是 **Hub 签发**的 token。每台机器的 JWT 密钥独立，自己签的对方验不过（`credential signature is invalid`）。
+2. **`?insecure=1` 只使用于加密覆盖网**（WireGuard / EasyTier / Tailscale）。不带它的明文 HTTP 会被传输层拒绝，这是故意的：凭证不该在不可信链路上明文传输。
+3. **`push` 列的分支必须存在于 Hub**。首次自举需要先建分支（服务端已支持向空仓库推首条，但两端分支名要对齐）。
+
+Hub 侧如果配了 `on_receive`，其它 Spoke 会在 Hub 收到推送后立即被扇出，不用等轮询周期。
+
 
 在 `~/.zero-memcp/config.json` 中配置多张凭证：
 

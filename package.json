@@ -1,13 +1,25 @@
 {
   "name": "@open-mcp-ai/pi-extension-zero-memcp",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Pi agent extension for zero-memcp: identity injection, recall, and automatic memory committing",
   "type": "module",
   "main": "index.js",
   "bin": {
     "zero-memcp-import": "./bin/import-sessions.js",
     "zero-memcp-layer-import": "./bin/layer-import.js",
-    "zero-memcp-sync-me": "./bin/sync-me.js"
+    "zero-memcp-sync-me": "./bin/sync-me.js",
+    "zero-memcp-init": "./bin/init.js",
+    "zero-memcp-doctor": "./bin/doctor.js"
+  },
+  "files": [
+    "index.js",
+    "bin/",
+    "config.example.json",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18.0.0"
   },
   "repository": {
     "type": "git",

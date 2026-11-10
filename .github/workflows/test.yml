@@ -1,0 +1,34 @@
+# 每次 push / PR 跑一遍测试。
+#
+# 为什么值得为 47 个单测配 CI：这个扩展的失败是**静默**的（联想超时走空、
+# 写入被拒也不拦对话），坏掉的时候没有任何人会立刻发现，只会表现为
+# 「最近好像没记住什么」。CI 是唯一能在交付前拦住这种退化的地方。
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 18 是引擎下限（原生 fetch / AbortSignal.timeout / node --test）
+        node: ['18', '20', '22']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      # 没有运行时依赖，跳过 install 反而更忠实：CI 覆盖的就是「零依赖也能跑」
+      - name: 单元测试
+        run: npm test
+      - name: CLI 可执行性冒烟
+        run: |
+          node bin/doctor.js --help > /dev/null
+          node bin/init.js --help > /dev/null
+          node --check index.js
+          for f in bin/*.js; do node --check "$f"; done
