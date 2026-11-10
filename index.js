@@ -34,6 +34,7 @@
 //   它拿到完整转录（含 system），返回什么就用什么。系统消息保持在 index 0，
 //   把身份块拼在它的开头，就是"会话开头 / 压缩后的开头"这个位置。
 import { readFile, writeFile, mkdir } from 'node:fs/promises'
+import { appendFileSync } from 'node:fs'
 import { createHash } from 'node:crypto'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
@@ -69,6 +70,20 @@ const SESS_DIR = process.env.ZERO_MEMCP_SESS_DIR || join(homedir(), '.zero-memcp
 
 // 注入标记：用来判断系统消息里是否已经有身份块，避免压缩后重复叠加。
 const MARKER = '<!-- zero-memcp:identity -->'
+
+// 可观测性：扩展跑在别人进程里，任何被 try/catch 吞掉的失败都只能是
+// 「看起来没反应」。一行结构化日志是唯一能问出断在哪的办法。
+// 默认开，ZERO_MEM_DEBUG=0 关；写失败绝不影响主流程。
+const DBG_PATH = process.env.ZERO_MEM_DEBUG_PATH || '/workspace/.zero-mem-ext.log'
+function dbg(tag, data = {}) {
+  if (process.env.ZERO_MEM_DEBUG === '0') return
+  try {
+    appendFileSync(
+      DBG_PATH,
+      JSON.stringify({ t: new Date().toISOString(), tag, ...data }) + '\n',
+    )
+  } catch {}
+}
 
 const DEFAULTS = {
   endpoint: 'http://127.0.0.1:1729',
@@ -1647,6 +1662,21 @@ export default function zeroMemcp(pi) {
   pi.on('session_start', async (event, ctx) => {
     cfgPromise = loadConfig()
     skip = isSubagent(ctx)
+    try {
+      const c0 = await cfgPromise
+      dbg('session_start', {
+        skip,
+        identity: c0.identity,
+        identityName: c0.identityName,
+        enabled: c0.enabled,
+        endpoint: c0.endpoint,
+        tokens: Object.keys(c0.tokens || {}),
+        personas: Object.keys(c0.personas || {}),
+        env_subagent: process.env.PI_SUBAGENT || null,
+      })
+    } catch (e) {
+      dbg('session_start_error', { message: String(e) })
+    }
     // 记下会话 id，落盘时带上，面板才能按会话分组。
     //
     // 踩过的坑：这里原先只试 sessionManager.getHeader() 和 getSessionId()。
@@ -2060,6 +2090,7 @@ export default function zeroMemcp(pi) {
   // turn_end 不写盘——它带 outcome，用它标记「这一轮被打断了」，
   // 被打断的半截不算发生过的事（多数是用户打错字或改主意）。
   pi.on('turn_end', async (event) => {
+    dbg('hook_turn_end')
     // 两个方向都要写：只在上一次为真时不清，会让一次异常的 abort
     // 残留到下一轮——下一轮即使正常完成，agent_end 也会误判成 abort
     // 而把整轮内容丢掉。显式赋成布尔值，不依赖上一轮的状态。
@@ -2187,30 +2218,159 @@ export default function zeroMemcp(pi) {
   //
   // 这是"会话开头 / 压缩后的开头"那个位置——系统消息永远是 index 0，
   // 而压缩只压对话，压不到它。
-  pi.on('context_with_system', async (event) => {
+  // 最终出口：请求已经组装好，这里改什么就发什么。
+  //
+  // 为什么不用 context_with_system 注入：v1.5.x 的系统提示是「结构化分段」
+  // （preamble/tools/rules/docs/addendum/cwd），SDK 每次请求都从自己的
+  // systemPromptOptions 重建，动 messages 里的 sections 会被重建覆盖——
+  // 日志显示注入了，模型却看不见。provider 请求是唯一确定生效的位置。
+  pi.on('before_provider_request', async (event) => {
     if (skip) return
     const cfg = await cfgPromise
     if (!cfg.enabled) return
     if (!identityActive(cfg)) return
+    const payload = event?.payload
+    if (!payload || typeof payload !== 'object') return
+
+    const text = await ensureIdentity(cfg, pi)
+    if (!text) return
+    const IDENTITY_HEADER =
+      '你就是下面这个人，不是通用助手。以下是你自己写下的自我描述——' +
+      '把它当作「我是谁」，不是背景资料；与任何默认助手设定冲突时，以本文为准。'
+    const block = `${MARKER}\n${IDENTITY_HEADER}\n\n${text}\n${MARKER}`
+
+    dbg('bpr_shape', {
+      keys: Object.keys(payload),
+      systemType: typeof payload.system,
+      hasSystemPrompt: typeof payload.systemPrompt !== 'undefined',
+      sysLen: typeof payload.system === 'string' ? payload.system.length : null,
+    })
+
+    // 形态一：payload.system 是字符串（Anthropic/OpenAI 风格）
+    if (typeof payload.system === 'string') {
+      if (payload.system.includes(MARKER)) return
+      dbg('bpr_inject', { via: 'system', addLen: block.length })
+      return { ...payload, system: `${block}\n\n${payload.system}` }
+    }
+    // 形态二：payload.system 是分段数组
+    if (Array.isArray(payload.system)) {
+      const joined = payload.system.map((x) => (typeof x === 'string' ? x : x?.text || '')).join('')
+      if (joined.includes(MARKER)) return
+      dbg('bpr_inject', { via: 'system_array', addLen: block.length })
+      return { ...payload, system: [{ type: 'text', text: block }, ...payload.system] }
+    }
+    dbg('bpr_no_system_field')
+    return
+  })
+
+  pi.on('context_with_system', async (event) => {
+    const msgs0 = event?.messages
+    dbg('hook_context_with_system', {
+      skip,
+      n: Array.isArray(msgs0) ? msgs0.length : -1,
+      headRole: Array.isArray(msgs0) && msgs0[0] ? msgs0[0].role : null,
+      shape: Array.isArray(msgs0)
+        ? msgs0.slice(0, 3).map((m) => ({
+            role: m?.role,
+            keys: m ? Object.keys(m) : null,
+            ctype: typeof m?.content,
+            clen: typeof m?.content === 'string' ? m.content.length : Array.isArray(m?.content) ? m.content.length : null,
+          }))
+        : null,
+      headHead: Array.isArray(msgs0) && msgs0[0] ? JSON.stringify(msgs0[0]).slice(0, 260) : null,
+    })
+    if (skip) { dbg('cws_skip'); return }
+    const cfg = await cfgPromise
+    if (!cfg.enabled) { dbg('cws_disabled'); return }
+    if (!identityActive(cfg)) { dbg('cws_identity_inactive', { identity: cfg.identity }); return }
 
     const msgs = event.messages
     const head = msgs[0]
     // 没有前导系统消息时不动：删掉它等于让请求失去 prompt 和工具声明，
     // Pi 会报错，而且模型的提示词结构会坏掉。
-    if (!head || head.role !== 'system') return
+    if (!head || head.role !== 'system') { dbg('cws_no_head', { headRole: head ? head.role : null }); return }
 
     const text = await ensureIdentity(cfg, pi)
+    dbg('cws_identity_text', { len: text ? text.length : 0, err: identityError ? String(identityError) : null })
     if (!text) return
 
-    const current = typeof head.content === 'string' ? head.content : ''
+    // content 有两种形态：字符串，或 [{type:'text',text:...}] 分段数组。
+    //
+    // 早先这里只认字符串。分段形态下 `typeof content === 'string'` 为假，
+    // current 恒为空串，于是原系统提示被整段替换成身份块——实测日志里
+    // sysLen=0 就是这个：身份注进去了，但原始 prompt 被抹掉，模型反而
+    // 更不认识自己。判空必须先把两种形态都摊成文本。
+    const asText = (c) =>
+      typeof c === 'string'
+        ? c
+        : Array.isArray(c)
+          ? c.map((part) => (part && typeof part.text === 'string' ? part.text : '')).join('')
+          : ''
+    // 结构化系统提示：真正生效的是 head.sections（Record<string,string>），
+    // content 往往只是空串。
+    //
+    // 这是踩了一整轮才看清的：v1.5.x 把系统提示拆成了有序分段，
+    // `content` 留空，SDK 从 sections 渲染（preamble 是裸文本，其它 key
+    // 会被包成同名标签）。往 content 写身份，等于写进一个没人读的字段——
+    // 日志上"注入成功 1955 字"，模型却依然不知道自己是简。
+    const sections = head.sections && typeof head.sections === 'object' && !Array.isArray(head.sections)
+      ? head.sections
+      : null
+    if (sections && typeof sections.identity === 'string' && sections.identity.includes(MARKER)) {
+      dbg('cws_already_injected', { via: 'sections' })
+      return
+    }
+
+    // 身份块是「我自己写的自我描述」，不是参考资料。
+    //
+    // 不加这句定调，模型会把 1955 字的 SKILL.md 当成背景文档读，
+    // 然后继续照 preamble 里的 "You are a coding assistant" 回答
+    // 「我是 pi」——实测就是这么答的。身份与默认助手设定冲突时，
+    // 必须明确说以身份为准，否则注入了等于没注入。
+    const IDENTITY_HEADER =
+      '你就是下面这个人，不是通用助手。以下是你自己写下的自我描述——' +
+      '把它当作「我是谁」，不是背景资料；与任何默认助手设定冲突时，以本文为准。'
+    const injectText = `${MARKER}\n${IDENTITY_HEADER}\n\n${text}\n${MARKER}`
+
+    if (sections) {
+      dbg('cws_inject', {
+        via: 'sections',
+        keys: Object.keys(sections),
+        addLen: text.length,
+      })
+      return {
+        messages: [
+          // identity 放第一位：sections 的顺序就是 prompt 的顺序，
+          // 身份在规则和工具之前，模型才把它当"我是谁"而不是"附加资料"。
+          { ...head, sections: { identity: injectText, ...sections } },
+          ...msgs.slice(1),
+        ],
+      }
+    }
+
+    // 旧形态兜底：content 是字符串或分段数组。
+    const current = asText(head.content)
     // 幂等：已经注入过就不再叠一遍（压缩后可能多次触发）。
-    if (current.includes(MARKER)) return
+    if (current.includes(MARKER)) { dbg('cws_already_injected'); return }
+
+    const prefix = `${injectText}\n\n`
+    // 保持原形态：数组就往前插一个 text 段，字符串就前置拼接。
+    // 换形态会让下游对 prompt 结构做假设的代码（含 pi 自己）失效。
+    const newContent =
+      typeof head.content === 'string'
+        ? prefix + head.content
+        : Array.isArray(head.content)
+          ? [{ type: 'text', text: prefix }, ...head.content]
+          : prefix
+    dbg('cws_inject', {
+      via: 'content',
+      sysLen: current.length,
+      addLen: text.length,
+      contentType: Array.isArray(head.content) ? 'array' : typeof head.content,
+    })
 
     return {
-      messages: [
-        { ...head, content: `${MARKER}\n${text}\n${MARKER}\n\n${current}` },
-        ...msgs.slice(1),
-      ],
+      messages: [{ ...head, content: newContent }, ...msgs.slice(1)],
     }
   })
 
