@@ -247,34 +247,50 @@ export class WakePolicy {
  *
  * 刻意不渲染正文：正文必须经 mem 工具读回才会落进 tool_result 沙盒。
  */
-export function renderWakePrompt(events) {
+export function renderWakePrompt(events, snippets) {
   if (!events.length) return ''
-  const lines = []
   const seen = new Set()
+  const parts = []
+
   for (const ev of events) {
     if (seen.has(ev.uri)) continue
     seen.add(ev.uri)
-    const addr = ev.uri.replace(/^memcp:\/\//, '').replace('/', '@')
+    const addr = uriToAddr(ev.uri)
     const from = ev.origin?.identity ? ` by ${ev.origin.identity}` : ''
-    const at = ev.commit ? ` @${ev.commit.slice(0, 8)}` : ''
-    lines.push(`- ${addr}${at}${from}`)
+    const snip = snippets?.[ev.uri]
+
+    // 有正文就贴正文，没有就只给地址。
+    //
+    // 这里刻意不认识任何来源：不写"QQ"、不写"群号"、不解析字段。
+    // 来源由写入方在正文头部的信封里自己声明（source/chat/from/...），
+    // 扩展只负责原样搬运。新增来源（贴吧、微信）不需要改这里。
+    if (snip) {
+      parts.push(`[zero-memcp] 新输入${from}`, `  ${addr}`, '', indent(snip), '')
+    } else {
+      parts.push(`[zero-memcp] 新输入${from}`, `  ${addr}`, '')
+    }
   }
-  // 事件不再携带 commit：写入即通知，脏层里没有新版本号。
-  //
-  // 早先文案让人 `since <tree> <commit>` 取差量。广播点从 commit 挪到写入后，
-  // 那个 commit 是「写入前的头」——拿它取差量只会得到空。
-  // 正确的动作是直接去看那棵树，所以文案改成让人去读。
-  return [
-    '[zero-memcp] 有新的写入需要处理：',
-    ...lines,
-    '',
-    '这些树刚被写过（可能还没折叠成提交）。用 mem 工具直接看：',
-    '  mem({ cmd: "ls <日期>" })      看某天有什么',
-    '  mem({ cmd: "grep <关键词> --scope <树>" })',
-    '  mem({ cmd: "recall <问题>" })   语义检索',
-    '若这些变更不需要动作，直接回复即可。',
-  ].join('\n')
+
+  parts.push('用 mem 读全文（read <地址>）。处理完清除条目；要不要记进自己的记忆由你判断。')
+  return parts.join('\n')
 }
+
+/** memcp://BlackEggAI%2Fzero/inbox → BlackEggAI/zero@inbox */
+export function uriToAddr(uri) {
+  const rest = decodeURIComponent(String(uri || '').replace(/^memcp:\/\//, ''))
+  const i = rest.lastIndexOf('/')
+  if (i < 0) return rest
+  return `${rest.slice(0, i)}@${rest.slice(i + 1)}`
+}
+
+function indent(text) {
+  return String(text)
+    .split('\n')
+    .slice(0, 12)
+    .map((l) => `  ${l}`)
+    .join('\n')
+}
+
 
 /**
  * 把积压渲染成 context 提示行（notify 模式）。

@@ -1,7 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert'
 import {
-  WakePolicy, shouldIgnore, parseFrame, renderWakePrompt, renderPending, makeSessionTag,
+  WakePolicy, shouldIgnore, parseFrame, renderWakePrompt, renderPending, makeSessionTag, uriToAddr,
 } from '../bin/wake.js'
 
 const ev = (session, identity = 'laptop', uri = 'memcp://daily/zero') => ({
@@ -179,15 +179,29 @@ test('parseFrame 忽略心跳与非 JSON', () => {
   assert.equal(parseFrame(': keepalive\n\ndata: not-json\n\n').events.length, 0)
 })
 
-test('renderWakePrompt 只给地址与读取命令，不含正文', () => {
-  const s = renderWakePrompt([{ uri: 'memcp://BlackEggAI/zero/main.record', commit: 'abcd1234ef', origin: { identity: 'desktop' } }])
-  assert.match(s, /BlackEggAI@zero/)
-  assert.match(s, /by desktop/)
-  assert.match(s, /abcd1234/)
-  // 广播点从 commit 挪到写入后，脏层没有新版本号：取差量已无意义，
-  // 文案改为直接看树。
-  assert.match(s, /mem\(\{ cmd: "ls/)
-  assert.doesNotMatch(s, /正文内容/)
+test('renderWakePrompt 带正文时原样展示，不认识来源', () => {
+  const uri = 'memcp://BlackEggAI%2Fzero/inbox'
+  const snip = 'source: qq\nchat: 254203716\nfrom: 阿蓝\n---\n在吗'
+  const s = renderWakePrompt([{ uri, origin: { identity: 'qqmcp-inbox' } }], { [uri]: snip })
+  assert.match(s, /BlackEggAI\/zero@inbox/)
+  assert.match(s, /by qqmcp-inbox/)
+  // 信封原样搬运：扩展不解析、不改写成"某分支有变动"
+  assert.match(s, /source: qq/)
+  assert.match(s, /chat: 254203716/)
+  assert.match(s, /在吗/)
+  // 不能出现任何来源专有的措辞
+  assert.doesNotMatch(s, /QQ 新消息|群\/会话/)
+})
+
+test('renderWakePrompt 取不到正文时退化为只给地址', () => {
+  const s = renderWakePrompt([{ uri: 'memcp://BlackEggAI%2Fzero/inbox', origin: { identity: 'x' } }])
+  assert.match(s, /BlackEggAI\/zero@inbox/)
+  assert.match(s, /read <地址>/)
+})
+
+test('uriToAddr 解转义并拆分支', () => {
+  assert.equal(uriToAddr('memcp://BlackEggAI%2Fzero/inbox'), 'BlackEggAI/zero@inbox')
+  assert.equal(uriToAddr('memcp://daily/zero'), 'daily@zero')
 })
 
 test('renderPending 只给地址', () => {

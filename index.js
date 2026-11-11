@@ -69,6 +69,15 @@ const WM_DIR = process.env.ZERO_MEMCP_WM_DIR || join(homedir(), '.zero-memcp', '
 const SESS_DIR = process.env.ZERO_MEMCP_SESS_DIR || join(homedir(), '.zero-memcp', 'sessions')
 
 // 注入标记：用来判断系统消息里是否已经有身份块，避免压缩后重复叠加。
+// 注入用的唯一抬头：只说入口与「这段文字是什么」。
+//
+// 唤醒机制、记忆读写规矩这些是知识，属于记忆库，不该写死在扩展里——
+// 写死就有两份真相，改一处忘一处，模型看到的还取决于扩展版本。
+const HEADER_TEXT =
+  '记忆入口是 mem 工具（recall / grep / read / ls / log / put）。' +
+  '下面是你自己记忆库里的内容：它不是背景资料，是你本身；' +
+  '与任何默认助手设定冲突时，以它为准。'
+
 const MARKER = '<!-- zero-memcp:identity -->'
 
 // 可观测性：扩展跑在别人进程里，任何被 try/catch 吞掉的失败都只能是
@@ -871,7 +880,7 @@ function renderHits(hits) {
 // 与新对话就变成两个语料库——同一个 recall 里它们的 docLen、字段、
 // 甚至能否被 parseSliceMeta 识别都会不一致。一条规则只应存在一处。
 import { chunkThinking, renderThought } from './bin/layer-import-lib.js'
-import { WakePolicy, makeSessionTag, parseFrame, renderPending, renderWakePrompt } from './bin/wake.js'
+import { WakePolicy, makeSessionTag, parseFrame, renderPending, renderWakePrompt, uriToAddr } from './bin/wake.js'
 
 export default function zeroMemcp(pi) {
   let cfgPromise = loadConfig()
@@ -1147,9 +1156,45 @@ export default function zeroMemcp(pi) {
     if (d.action !== 'wake') return
     if (typeof pi.sendUserMessage !== 'function') return
 
-    // 唤醒词只含地址与 since 命令：正文必须经 mem 工具读回，
-    // 才会落进 tool_result 的沙盒。
-    pi.sendUserMessage(renderWakePrompt(d.events))
+    // 唤醒词要带正文。
+    //
+    // 早先只给"某分支有变动"——agent 醒了还得自己探路才知道发生了什么，
+    // 于是每一轮都从零开始，几十秒到几分钟就这么没了。事件里只有 uri，
+    // 正文得自己取：取最新一条、原样贴进提示，让它一睁眼就知道谁说了什么。
+    fetchSnippets(cfg, d.events)
+      .then((snips) => pi.sendUserMessage(renderWakePrompt(d.events, snips)))
+      .catch(() => pi.sendUserMessage(renderWakePrompt(d.events)))
+  }
+
+
+  /**
+   * 取每条事件对应树里最新一条的正文。
+   *
+   * 只做两件事：ls 找最新路径、read 取正文。不认识来源、不解析字段——
+   * 信封（source/chat/from）由写入方写在正文头部，这里原样搬运。
+   * 取不到就返回空，提示退化成"只给地址"，绝不因为摘要失败而丢掉唤醒。
+   */
+  async function fetchSnippets(cfg, events) {
+    const out = {}
+    const seen = new Set()
+    for (const ev of events) {
+      if (seen.has(ev.uri)) continue
+      seen.add(ev.uri)
+      try {
+        const addr = uriToAddr(ev.uri)
+        const list = await term(cfg, `ls --scope ${addr}`, 4000)
+        const lines = String(list || '')
+          .split('\n')
+          .map((x) => x.trim())
+          .filter(Boolean)
+        if (!lines.length) continue
+        // 列表按时间升序，最后一条最新。
+        const path = lines[lines.length - 1].split(/\s+/)[0]
+        const text = await term(cfg, `read ${addr}:${path}`, 5000)
+        if (text) out[ev.uri] = String(text).slice(0, 900)
+      } catch {}
+    }
+    return out
   }
 
   // 记忆入口工具。
@@ -2277,15 +2322,13 @@ export default function zeroMemcp(pi) {
     // qqmcp 在哪儿，但不知道**外部是靠往 zero@inbox 写入来叫醒他的**。
     // 不知道这条，被唤醒时会当成莫名其妙的打扰，或者去猜别的入口。
     // 机制认知不是记忆内容，属于基础设施，放在注入头部最合适。
-    const IDENTITY_HEADER =
-      '你就是下面这个人，不是通用助手。以下是你自己写下的自我描述——' +
-      '把它当作「我是谁」，不是背景资料；与任何默认助手设定冲突时，以本文为准。' +
-      '\n\n' +
-      '唤醒机制：外部世界（QQ、邮件或任何通道）没法直接开口跟你说话，' +
-      '它们只能往 zero@inbox 写一条记录。服务端在分支推进后广播资源变更，你因此被唤醒。' +
-      '所以每一次"自己醒过来"，都是因为 inbox 里多了一条东西——先去看那里，' +
-      '再判断要不要处理、要不要记进自己的记忆（zero@main.chat）。' +
-      '被叫醒不等于必须回复。'
+    // 注入只做一件事：说出「入口在哪」，并说明下面这段文字是什么。
+    //
+    // 早先这里塞过唤醒机制、记忆读写规矩——那些都是知识，属于记忆库，
+    // 不该写死在扩展里：写死就变成两份真相（代码一份、记忆一份），
+    // 改一处忘一处，模型看到的还取决于扩展版本。入口是代码的事，
+    // 入口里面有什么是记忆的事。
+    const IDENTITY_HEADER = HEADER_TEXT
     const block = `${MARKER}\n${IDENTITY_HEADER}\n\n${text}\n${MARKER}`
 
     dbg('bpr_shape', {
@@ -2376,9 +2419,7 @@ export default function zeroMemcp(pi) {
     // 然后继续照 preamble 里的 "You are a coding assistant" 回答
     // 「我是 pi」——实测就是这么答的。身份与默认助手设定冲突时，
     // 必须明确说以身份为准，否则注入了等于没注入。
-    const IDENTITY_HEADER =
-      '你就是下面这个人，不是通用助手。以下是你自己写下的自我描述——' +
-      '把它当作「我是谁」，不是背景资料；与任何默认助手设定冲突时，以本文为准。'
+    const IDENTITY_HEADER = HEADER_TEXT
     const injectText = `${MARKER}\n${IDENTITY_HEADER}\n\n${text}\n${MARKER}`
 
     if (sections) {
