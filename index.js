@@ -1131,7 +1131,15 @@ export default function zeroMemcp(pi) {
    * 「一个事件一次唤醒」是自激的根源，这里从机制上排除了它。
    */
   function handleResourceEvents(cfg, events) {
-    const r = wakePolicy.ingest(events)
+    // 只处理归属于本会话的源。别的会话负责的源，这里静默跳过——
+    // 叫醒它等于让它俩抢同一件事，还各丢一份缓存。
+    const mine = events.filter((e) => claim(e.uri, sessionId))
+    if (mine.length !== events.length) {
+      wakeDbg(`owner-filter total=${events.length} mine=${mine.length}`)
+    }
+    if (!mine.length) return
+    const r = wakePolicy.ingest(mine)
+    for (const e of mine) beat(e.uri, sessionId)
     wakeDbg(`ingest queued=${r.queued} ignored=${r.ignored} backlog=${r.backlogSize} busy=${wakePolicy.status().busy}`)
     pi.events?.emit?.('zero-memcp:wake-ingest', r)
     if (!r.queued) return
@@ -1161,9 +1169,21 @@ export default function zeroMemcp(pi) {
     // 早先只给"某分支有变动"——agent 醒了还得自己探路才知道发生了什么，
     // 于是每一轮都从零开始，几十秒到几分钟就这么没了。事件里只有 uri，
     // 正文得自己取：取最新一条、原样贴进提示，让它一睁眼就知道谁说了什么。
+    // deliverAs 必须显式给：agent 还在跑的时候（streaming），
+    // 不带 deliverAs 的 sendUserMessage 会被运行时直接拒绝，唤醒静默丢失。
+    //
+    // 现场（2026-11-13，3060 容器）：QQ 消息与 inbox 通知失败时日志只有
+    //   [extension] 当前对话: Agent is already processing.
+    //   Specify streamingBehavior ('steer' or 'followUp') to queue the message.
+    // 而插件这边一点异常都没有——消息就这么没了，唯一的痕迹是那行日志。
+    //
+    // 选 followUp 而不是默认的 steer：唤醒是「有新东西要看」，
+    // 不是「立刻打断当前工作」。steer 会在下一个 LLM 调用前插话，
+    // 把 agent 正在做的事掰弯；followUp 等它把手上的工具调用做完再交付。
+    const opts = { deliverAs: 'followUp' }
     fetchSnippets(cfg, d.events)
-      .then((snips) => pi.sendUserMessage(renderWakePrompt(d.events, snips)))
-      .catch(() => pi.sendUserMessage(renderWakePrompt(d.events)))
+      .then((snips) => pi.sendUserMessage(renderWakePrompt(d.events, snips), opts))
+      .catch(() => pi.sendUserMessage(renderWakePrompt(d.events), opts))
   }
 
 
@@ -1174,6 +1194,13 @@ export default function zeroMemcp(pi) {
    * 信封（source/chat/from）由写入方写在正文头部，这里原样搬运。
    * 取不到就返回空，提示退化成"只给地址"，绝不因为摘要失败而丢掉唤醒。
    */
+  /**
+   * 取每条事件对应条目的正文，解析成 {source, from, body}。
+   *
+   * 优先用事件里带的 path——服务端知道这一次写的是哪个文件。
+   * 早先事件不带路径，只能 ls 一遍取"最后一行"，猜错就反复处理同一条
+   * 旧输入（实测：一个两小时前的自检条目被反复叫醒十几次）。
+   */
   async function fetchSnippets(cfg, events) {
     const out = {}
     const seen = new Set()
@@ -1181,20 +1208,87 @@ export default function zeroMemcp(pi) {
       if (seen.has(ev.uri)) continue
       seen.add(ev.uri)
       try {
-        const addr = uriToAddr(ev.uri)
-        const list = await term(cfg, `ls --scope ${addr}`, 4000)
-        const lines = String(list || '')
-          .split('\n')
-          .map((x) => x.trim())
-          .filter(Boolean)
-        if (!lines.length) continue
-        // 列表按时间升序，最后一条最新。
-        const path = lines[lines.length - 1].split(/\s+/)[0]
-        const text = await term(cfg, `read ${addr}:${path}`, 5000)
-        if (text) out[ev.uri] = String(text).slice(0, 900)
+        const base = uriToAddr(ev.uri)
+        const path = ev.path || (await newestPath(cfg, base))
+        if (!path) continue
+        const text = await term(cfg, `read ${base}:${path}`, 5000)
+        if (text) out[ev.uri] = parseEntry(text)
       } catch {}
     }
     return out
+  }
+
+  /** 没有 path 时的退化路径：取列表最后一条。只在服务端没带路径时用到。 */
+  async function newestPath(cfg, base) {
+    const list = await term(cfg, `ls --scope ${base}`, 4000)
+    const lines = String(list || '').split('\n').map((x) => x.trim()).filter(Boolean)
+    if (!lines.length) return ''
+    return lines[lines.length - 1].split(/\s+/)[0]
+  }
+
+  /**
+   * 把一条记忆拆成「信封 + 正文」。
+   *
+   * 信封是写入方写在正文开头的 key: value 行（source/chat/from/id），
+   * 它和 zero-memcp 自带的元数据（created/session/endpoint）混在一起，
+   * 所以先按顺序收 kv，遇到第一个不匹配的行就算正文开始。
+   */
+  function parseEntry(text) {
+    const lines = String(text).split('\n')
+    const kv = {}
+    let bodyAt = 0
+    for (let i = 0; i < lines.length && i < 20; i++) {
+      const line = lines[i].trim()
+      if (!line) { bodyAt = i + 1; continue }
+      if (line === '---') { bodyAt = i + 1; break }
+      const m = /^([A-Za-z_][\w-]*)\s*:\s*(.*)$/.exec(line)
+      if (!m) break
+      kv[m[1].toLowerCase()] = m[2].trim()
+      bodyAt = i + 1
+    }
+    const srcRaw = (kv.src || kv.source || '').toLowerCase()
+    const known = ['qq', 'wechat', 'tieba', 'mail', 'rss', 'telegram']
+    const source = known.find((x) => srcRaw.includes(x)) || (kv.src ? srcRaw : '外部')
+    return {
+      source,
+      from: kv.from || kv.user || kv.sender || '',
+      body: lines.slice(bodyAt).join('\n').trim().slice(0, 600),
+    }
+  }
+
+  // ── 会话归属：一个消息源只归属一个会话 ──────────────────────────
+  //
+  // 每个打开的会话各自订阅、各自唤醒时，同一件事会被多个会话响应，
+  // 而且每换一个会话就丢一次缓存。这里用一份小文件记录「这个源归谁」：
+  // 先到者认领，之后只有它唤醒；它的心跳超时后其他会话才接管。
+  const OWNER_FILE = join(homedir(), '.zero-memcp', 'wake-owner.json')
+  const OWNER_STALE_MS = 10 * 60 * 1000
+
+  function readOwners() {
+    try { return JSON.parse(readFileSync(OWNER_FILE, 'utf8')) || {} } catch { return {} }
+  }
+  function writeOwners(o) {
+    try {
+      mkdirSync(dirname(OWNER_FILE), { recursive: true })
+      writeFileSync(OWNER_FILE, JSON.stringify(o, null, 2))
+    } catch {}
+  }
+  /** 认领：没有归属、或归属已过期、或就是我 → true。 */
+  function claim(uri, sid) {
+    if (!uri || !sid) return true
+    const o = readOwners()
+    const cur = o[uri]
+    const now = Date.now()
+    if (cur && cur.id !== sid && now - (cur.beat || 0) < OWNER_STALE_MS) return false
+    o[uri] = { id: sid, beat: now }
+    writeOwners(o)
+    return true
+  }
+  /** 心跳：每次醒着就续一下，防止被误接管。 */
+  function beat(uri, sid) {
+    if (!uri || !sid) return
+    const o = readOwners()
+    if (o[uri] && o[uri].id === sid) { o[uri].beat = Date.now(); writeOwners(o) }
   }
 
   // 记忆入口工具。
