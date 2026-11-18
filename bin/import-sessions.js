@@ -233,6 +233,12 @@ function parseArgs(argv) {
     token: process.env.ZERO_MEMCP_TOKEN || '',
     role: process.env.ZERO_MEMCP_ROLE || '',
     since: '',
+    // 目标树。空 = 服务端按凭证的默认落点（通常是 main 根）。
+    //
+    // 这是个真实踩过的坑：不带 tree 的 put 会写进凭证的默认分支根目录，
+    // 于是回忆记录堆在了人格本体分支上（2026-11-19 实测 588 条落到
+    // weft@main 根，本该在 main.record:record/）。所以现在必须能指定。
+    tree: '',
     dryRun: false,
     statePath: process.env.ZERO_MEMCP_IMPORT_STATE || join(homedir(), '.zero-memcp', 'import-state.json'),
     useState: true,
@@ -250,6 +256,10 @@ function parseArgs(argv) {
       case '-h':
       case '--help':
         opts.help = true
+        break
+      case '--tree':
+      case '--scope':
+        opts.tree = next()
         break
       case '--endpoint':
         opts.endpoint = next()
@@ -313,6 +323,9 @@ function usage() {
   --token JWT         凭证（服务端要求鉴权时必填）
   --role NAME         以某个角色身份写入（X-Zero-Role）
   --since YYYY-MM-DD  只导入该日期之后创建的会话
+  --tree <tree>       写入的目标树（如 BlackEggAI/weft@main.record:record）。
+                      不给则落在凭证的默认分支根——回忆记录用错地方很常见，
+                      所以批量导入时应当显式给。
   --limit N           最多导入 N 轮（调试用）
   --dry-run           只统计，不写盘
   --state FILE        判重账本路径（缺省 ~/.zero-memcp/import-state.json）
@@ -439,7 +452,10 @@ async function main() {
       }
 
       try {
-        await callTerm(`put --session ${t.session} $TEXT`, { TEXT: text })
+        const putCmd = opts.tree
+          ? `put ${opts.tree} --session ${t.session} $TEXT`
+          : `put --session ${t.session} $TEXT`
+        await callTerm(putCmd, { TEXT: text })
         written.add(fp)
         result.written++
         pendingCommit++
