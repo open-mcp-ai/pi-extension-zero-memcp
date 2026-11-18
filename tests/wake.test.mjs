@@ -1,8 +1,16 @@
 import { test } from 'node:test'
 import assert from 'node:assert'
+import { createServer } from 'node:http'
+import { createWakeHttpServer } from '../index.js'
 import {
-  WakePolicy, shouldIgnore, parseFrame, renderWakePrompt, renderPending, makeSessionTag, uriToAddr,
+  WakePolicy, shouldIgnore, normPath, parseFrame, parseEntry, renderWakePrompt, renderPending, makeSessionTag,
 } from '../bin/wake.js'
+
+function listen(srv) {
+  return new Promise((res) => {
+    srv.listen(0, '127.0.0.1', () => res(srv.address().port))
+  })
+}
 
 const ev = (session, identity = 'laptop', uri = 'memcp://daily/zero') => ({
   uri, commit: 'aaaa1111', previous: 'bbbb2222', origin: { session, identity },
@@ -179,29 +187,13 @@ test('parseFrame 忽略心跳与非 JSON', () => {
   assert.equal(parseFrame(': keepalive\n\ndata: not-json\n\n').events.length, 0)
 })
 
-test('renderWakePrompt 带正文时原样展示，不认识来源', () => {
-  const uri = 'memcp://BlackEggAI%2Fzero/inbox'
-  const snip = 'source: qq\nchat: 254203716\nfrom: 阿蓝\n---\n在吗'
-  const s = renderWakePrompt([{ uri, origin: { identity: 'qqmcp-inbox' } }], { [uri]: snip })
-  assert.match(s, /BlackEggAI\/zero@inbox/)
-  assert.match(s, /by qqmcp-inbox/)
-  // 信封原样搬运：扩展不解析、不改写成"某分支有变动"
-  assert.match(s, /source: qq/)
-  assert.match(s, /chat: 254203716/)
-  assert.match(s, /在吗/)
-  // 不能出现任何来源专有的措辞
-  assert.doesNotMatch(s, /QQ 新消息|群\/会话/)
-})
-
-test('renderWakePrompt 取不到正文时退化为只给地址', () => {
-  const s = renderWakePrompt([{ uri: 'memcp://BlackEggAI%2Fzero/inbox', origin: { identity: 'x' } }])
-  assert.match(s, /BlackEggAI\/zero@inbox/)
-  assert.match(s, /read <地址>/)
-})
-
-test('uriToAddr 解转义并拆分支', () => {
-  assert.equal(uriToAddr('memcp://BlackEggAI%2Fzero/inbox'), 'BlackEggAI/zero@inbox')
-  assert.equal(uriToAddr('memcp://daily/zero'), 'daily@zero')
+test('没有正文时唤醒提示只给地址，不编内容', () => {
+  // 行为已经变过：早先只给地址 + since 命令，后来改成「有正文就给正文」。
+  // 这条守的是退化路径——取不到 snippets 时仍然只能给地址，不能凭空造内容。
+  const s = renderWakePrompt([{ uri: 'memcp://BlackEggAI/zero/main.record', commit: 'abcd1234ef', origin: { identity: 'desktop' } }])
+  assert.match(s, /BlackEggAI\/zero@main\.record/)
+  assert.match(s, /有新消息/)
+  assert.doesNotMatch(s, /正文内容/)
 })
 
 test('renderPending 只给地址', () => {
@@ -252,4 +244,93 @@ test('非 notify 模式的积压不能被 context 取走（否则唤醒永不发
   const r = p.settle()
   assert.equal(r.action, 'wake', '停稳后仍应能唤醒')
   assert.equal(r.events.length, 1)
+})
+
+// ── 唤醒提示必须带正文 ────────────────────────────────────────────
+//
+// 实测故障（2026-11-12）：提示词里只有「[外部] 有新消息（地址）」，
+// 没有发送者、没有正文。agent 每次醒来都得再花一个来回读详情，
+// 主人看到的结论是「推送没带内容」。
+// 根因是 parseEntry 把 qqmcp 的 frontmatter 当成信封结束，正文定位错。
+
+test('qqmcp 投递的正文与发送者能解析出来', () => {
+  const doc = `---
+source: qqmcp-inbox
+endpoint: 3060
+created: 2026-11-12T13:36:45+08:00
+session: qqmcp
+---
+
+inbox/qq evt=group:1090282018/1378275348
+at=2026-11-12T05:36:50.000Z src=group:1090282018 from=胖虫虫萨玛(3776785167) mid=1378275348 reply_to_id=1378275348
+
+=== 新消息开始 ===
+我说白了，还是那句话，国内安全跟国外安全逻辑不一样没法比
+=== 新消息结束 ===
+---
+【上下文】最近 6 条（旧→新，不含上面那条新消息）:
+13:34 小薛: 我又没说我是大佬`
+
+  const got = parseEntry(doc)
+  assert.equal(got.source, 'qq')
+  assert.equal(got.chat, '1090282018', '群号要能抽出来')
+  assert.equal(got.from, '胖虫虫萨玛', '发送者要去掉 uin 括号')
+  assert.equal(got.body, '我说白了，还是那句话，国内安全跟国外安全逻辑不一样没法比', '正文只取消息本体，不夹带上下文')
+})
+
+test('唤醒提示把来源会话、发送者和正文都写进去，而不是只说「有新消息」', () => {
+  const ev = { uri: 'memcp://BlackEggAI%2Fzero/inbox', path: 'qq-1.md/2026-11-12/1.md' }
+  const snips = { [ev.uri]: { source: 'qq', chat: '1090282018', from: '胖虫虫萨玛', body: '在吗' } }
+  const text = renderWakePrompt([ev], snips)
+  assert.match(text, /\[QQ:1090282018\] 胖虫虫萨玛：在吗/)
+  assert.match(text, /BlackEggAI\/zero@inbox:qq-1\.md/)
+})
+
+test('事件路径里的 @ 要归一成 /，否则 read 找不到文件', () => {
+  assert.equal(normPath('qq-1.md/2026-11-12@215053.484870-5490-3060.md'),
+    'qq-1.md/2026-11-12/215053.484870-5490-3060.md')
+  // 已经是 / 的原样返回
+  assert.equal(normPath('qq-1.md/2026-11-12/1.md'), 'qq-1.md/2026-11-12/1.md')
+
+  const ev = { uri: 'memcp://BlackEggAI%2Fzero/inbox', path: 'qq-1.md/2026-11-12@215053.484870-5490-3060.md' }
+  const text = renderWakePrompt([ev], {})
+  assert.match(text, /qq-1\.md\/2026-11-12\/215053/, '地址里不能留 @')
+})
+
+test('拿不到正文时退化成「有新消息」但地址仍在', () => {
+  const ev = { uri: 'memcp://BlackEggAI%2Fzero/inbox', path: 'x.md/1.md' }
+  const text = renderWakePrompt([ev], {})
+  assert.match(text, /有新消息/)
+  assert.match(text, /x\.md/)
+})
+
+// 18800 是外部世界认的门牌（qq-mcp / gateway 都往这里投），
+// 所以同一个处理函数要同时收 /wake 和 /notify —— 两套路径，一份逻辑。
+test('POST /notify 与 /wake 等价', async () => {
+  const seen = []
+  const srv = createWakeHttpServer({ inject: (p) => { seen.push(p); return true } })
+  const port = await listen(srv)
+  const body = JSON.stringify({ source: 'qq', text: '来自 /notify 的一条' })
+  const r = await fetch(`http://127.0.0.1:${port}/notify`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body,
+  })
+  assert.equal(r.status, 200)
+  assert.equal((await r.json()).injected, true)
+  assert.equal(seen.length, 1)
+  assert.equal(seen[0].text, '来自 /notify 的一条')
+  srv.close()
+})
+
+test('/notify 也守同一条底线：没 text 就拒', async () => {
+  const srv = createWakeHttpServer({ inject: () => true })
+  const port = await listen(srv)
+  const r = await fetch(`http://127.0.0.1:${port}/notify`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ source: 'qq' }),
+  })
+  assert.equal(r.status, 400)
+  srv.close()
 })

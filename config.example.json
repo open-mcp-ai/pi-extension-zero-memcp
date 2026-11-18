@@ -8,6 +8,7 @@
   "recallLayerTimeoutMs": 2000,
   "identity": "off",
   "identityName": "",
+  "identityMode": "full",
   "identityTtlMs": 3600000,
   "token": "",
   "tokens": {},

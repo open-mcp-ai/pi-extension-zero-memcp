@@ -113,6 +113,8 @@ ln -s /path/to/pi-extension-zero-memcp ~/.pi/agent/extensions/zero-memcp
 }
 ```
 
+`identityMode` 控制注入多少身份：`full`（默认，全量 SKILL.md + law，约 2.8KB）或 `minimal`（约 150 字符，只留 mem 入口，不联网取身份）。小模型用 `minimal`，切换不需要改文件：`/mem:mode minimal`（会话级）、`/mem:mode minimal global`（全局）。
+
 `identityTtlMs` 控制身份块的重取周期（默认 1 小时）。改过服务端的规则块或
 personas 之后，最多等一个周期就能在当前会话里看到新内容，不必重开会话。
 
@@ -187,7 +189,8 @@ recall $Q --scope zero-agi@fact || recall $Q --scope zero-agi@record || recall $
 
 用户在 TUI 输入框中可使用的 3 个斜杠命令：
 
-- `/mem:identity` — **身份 / 挂载**：空参显示当前身份、凭证能力与挂载范围；`/mem:identity <name>` 切换到一张已配置的凭证（等同换一个数据库连接），当前会话立即使用它；`on|off [global]` 控制本会话或全局默认是否启用记忆注入。
+- `/mem:mode` — **注入档位**：空参显示「本会话 X｜全局 Y」；`minimal|full` 切本会话；加 `global` 改全局默认。与身份无关，只管注入多少。
+- `/mem:identity` — **身份 / 挂载**：空参显示当前身份、凭证能力与挂载范围；`/mem:identity <name>` 切换到一张已配置的凭证（等同换一个数据库连接），当前会话立即使用它；`on|off [global]` 控制本会话或全局默认是否启用记忆注入。注入档位是另一件事，走 `/mem:mode`。
 - `/mem:sync` — **同步到记忆体**：手动把当前会话全部问答导入记忆库（按内容 checksum CAS 幂等，无重复开销）；
 - `/mem:record` — **自动记录**：空参查看状态；`/mem:record [on|off] [global]` 切换本会话或全局默认。
 

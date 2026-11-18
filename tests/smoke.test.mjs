@@ -68,7 +68,7 @@ async function loadExtension() {
 test('扩展能加载，并注册全部命令与工具', async () => {
   const stub = await loadExtension()
   assert.ok(stub.tools.has('mem'), '应注册 mem 工具')
-  for (const name of ['mem:sync', 'mem:record', 'mem:identity']) {
+  for (const name of ['mem:sync', 'mem:record', 'mem:identity', 'mem:mode']) {
     assert.ok(stub.commands.has(name), `应注册命令 ${name}`)
   }
 })
@@ -181,4 +181,107 @@ test('去重键用全文哈希而不是前缀截断', () => {
     '去重键不应使用前缀截断',
   )
   assert.match(src, /const key = createHash\('sha256'\)\.update\(text/, '去重键应为全文哈希')
+})
+
+test('identityMode=minimal 不联网、注入短、且仍带 MARKER', async () => {
+  // 这一档存在的理由：全量身份约 2KB，小模型（2b~7b）吃掉后剩下的窗口
+  // 不够干活。minimal 只留入口 + 一条纪律，长度必须压到 400 字符以内；
+  // endpoint 故意不可达——minimal 档不该为 2KB 跑一趟网络。
+  //
+  // 必须用带 query 的 import：CONFIG_FILE 是模块加载时读环境变量算出来的，
+  // 前面几个 test 已经加载过 index.js，直接 import 会复用旧路径，测的就不是这一档。
+  const { mkdtempSync, writeFileSync } = await import('node:fs')
+  const { tmpdir } = await import('node:os')
+  const { join } = await import('node:path')
+
+  const dir = mkdtempSync(join(tmpdir(), 'zm-min-'))
+  const cfgPath = join(dir, 'config.json')
+  writeFileSync(cfgPath, JSON.stringify({
+    endpoint: 'http://127.0.0.1:1',
+    enabled: true,
+    identity: 'on',
+    identityMode: 'minimal',
+    token: 'dummy',
+  }))
+
+  const prevCfg = process.env.ZERO_MEMCP_CONFIG
+  const prevDbg = process.env.ZERO_MEM_DEBUG
+  const prevPath = process.env.ZERO_MEM_DEBUG_PATH
+  process.env.ZERO_MEMCP_CONFIG = cfgPath
+  process.env.ZERO_MEM_DEBUG = '0'
+  process.env.ZERO_MEM_DEBUG_PATH = join(dir, 'dbg.log')
+  try {
+    const { default: zeroMemcp } = await import('../index.js?mode=minimal')
+    const stub = makePiStub()
+    await zeroMemcp(stub.api)
+    const handler = stub.events.get('before_provider_request')[0]
+    assert.ok(handler, '应注册 before_provider_request')
+    const out = await handler({ payload: { system: 'BASE' } })
+    const sys = out?.system || ''
+    assert.match(sys, /zero-memcp:identity/, '必须带 MARKER（幂等靠它）')
+    assert.match(sys, /recall/, '必须点出 mem 入口')
+    assert.ok(sys.length < 400, `minimal 档注入应短，实际 ${sys.length} 字符`)
+    assert.doesNotMatch(sys, /SKILL|law\//, 'minimal 档不该带全量身份内容')
+    assert.match(sys, /BASE/, '原系统提示必须保住')
+  } finally {
+    if (prevCfg === undefined) delete process.env.ZERO_MEMCP_CONFIG
+    else process.env.ZERO_MEMCP_CONFIG = prevCfg
+    if (prevDbg === undefined) delete process.env.ZERO_MEM_DEBUG
+    else process.env.ZERO_MEM_DEBUG = prevDbg
+    if (prevPath === undefined) delete process.env.ZERO_MEM_DEBUG_PATH
+    else process.env.ZERO_MEM_DEBUG_PATH = prevPath
+  }
+})
+
+test('provider payload 没有 system 字段时，注入进 messages[0]（ollama/OpenAI 兼容）', async () => {
+  // 实测故障：27b 走 ollama 的 OpenAI 兼容端点，payload 只有 model/messages/stream，
+  // 没有 system。旧代码在这个形态下直接 return——日志里只有 context_with_system
+  // 那条「注入成功」，provider 适配层却根本不读 sections，模型一个字都没看到。
+  const { mkdtempSync, writeFileSync } = await import('node:fs')
+  const { tmpdir } = await import('node:os')
+  const { join } = await import('node:path')
+
+  const dir = mkdtempSync(join(tmpdir(), 'zm-oll-'))
+  const cfgPath = join(dir, 'config.json')
+  writeFileSync(cfgPath, JSON.stringify({
+    endpoint: 'http://127.0.0.1:1', enabled: true, identity: 'on', identityMode: 'minimal', token: 'dummy',
+  }))
+
+  const prevCfg = process.env.ZERO_MEMCP_CONFIG
+  const prevDbg = process.env.ZERO_MEM_DEBUG
+  const prevPath = process.env.ZERO_MEM_DEBUG_PATH
+  process.env.ZERO_MEMCP_CONFIG = cfgPath
+  process.env.ZERO_MEM_DEBUG = '0'
+  process.env.ZERO_MEM_DEBUG_PATH = join(dir, 'dbg.log')
+  try {
+    const { default: zeroMemcp } = await import('../index.js?shape=ollama')
+    const stub = makePiStub()
+    await zeroMemcp(stub.api)
+    const bip = stub.events.get('before_provider_request')[0]
+    assert.ok(bip, '应注册 before_provider_request')
+
+    // 形态一：messages 里已有 system 消息
+    const out = await bip({ payload: { model: 'm', stream: true, messages: [
+      { role: 'system', content: 'You are pi.' }, { role: 'user', content: 'hi' },
+    ] } })
+    const sys = String(out.messages[0].content)
+    assert.match(sys, /zero-memcp:identity/, '身份块必须真的进 messages[0]')
+    assert.match(sys, /You are pi/, '原系统提示不能被覆盖')
+
+    // 形态二：连 system 消息都没有
+    const out2 = await bip({ payload: { model: 'm', messages: [{ role: 'user', content: 'hi' }] } })
+    assert.equal(out2.messages[0].role, 'system', '没有 system 消息时应补一条在最前')
+    assert.match(String(out2.messages[0].content), /zero-memcp:identity/)
+
+    // 幂等：已经带 MARKER 的请求不该再叠一层
+    const again = await bip({ payload: out })
+    assert.equal(again, undefined, '已注入过应原样放行（返回 undefined）')
+  } finally {
+    if (prevCfg === undefined) delete process.env.ZERO_MEMCP_CONFIG
+    else process.env.ZERO_MEMCP_CONFIG = prevCfg
+    if (prevDbg === undefined) delete process.env.ZERO_MEM_DEBUG
+    else process.env.ZERO_MEM_DEBUG = prevDbg
+    if (prevPath === undefined) delete process.env.ZERO_MEM_DEBUG_PATH
+    else process.env.ZERO_MEM_DEBUG_PATH = prevPath
+  }
 })

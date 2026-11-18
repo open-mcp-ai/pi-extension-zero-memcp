@@ -243,6 +243,21 @@ export class WakePolicy {
 }
 
 /**
+ * 事件里的路径分隔符和存储里的不一致，读之前得先归一。
+ *
+ * 实测（2026-11-12，重启后第一轮）：服务端资源事件的 path 形如
+ *   2026-11-12@215053.484870-5490-3060.md
+ * 而真正存进去的路径是
+ *   2026-11-12/215053.484870-5490-3060.md
+ * 只差 `@` 和 `/`。read 用 `@` 直接 not found，fetchSnippets 又静默吞异常，
+ * 于是唤醒词永远退化成「[外部] 有新消息」——看起来像「推送不带正文」，
+ * 实际是取正文那一步没找到文件。
+ */
+export function normPath(p) {
+  return String(p || '').replace(/(\d{4}-\d{2}-\d{2})@(?=\d{6}\.)/, '$1/')
+}
+
+/**
  * 把积压事件渲染成唤醒词。
  *
  * 刻意不渲染正文：正文必须经 mem 工具读回才会落进 tool_result 沙盒。
@@ -255,24 +270,31 @@ export function renderWakePrompt(events, snippets) {
   for (const ev of events) {
     if (seen.has(ev.uri)) continue
     seen.add(ev.uri)
-    const addr = uriToAddr(ev.uri)
-    const from = ev.origin?.identity ? ` by ${ev.origin.identity}` : ''
+    const path = normPath(ev.path)
+    const addr = path ? `${uriToAddr(ev.uri)}:${path}` : uriToAddr(ev.uri)
     const snip = snippets?.[ev.uri]
 
-    // 有正文就贴正文，没有就只给地址。
+    // 越短越好：一条消息 = 一行标题 + 正文 + 地址。
     //
-    // 这里刻意不认识任何来源：不写"QQ"、不写"群号"、不解析字段。
-    // 来源由写入方在正文头部的信封里自己声明（source/chat/from/...），
-    // 扩展只负责原样搬运。新增来源（贴吧、微信）不需要改这里。
-    if (snip) {
-      parts.push(`[zero-memcp] 新输入${from}`, `  ${addr}`, '', indent(snip), '')
+    // 早先把信封全部字段（source/endpoint/created/session/evt/at/src/from/mid）
+    // 原样倒出来，agent 得先读一堆元数据才看到谁说了什么。信封是给机器看的，
+    // 提示是给人看的：只留来源名、发送者、正文。
+    //
+    // 群里说的「不同群的消息混一起」是这条引起的：只写 [QQ] 名字，
+    // 同一拨人在两个群说话时分不清哪句出自哪个群。来源必须带会话 id。
+    const srcRaw = snip?.source ? String(snip.source).toUpperCase() : '外部'
+    const chat = snip?.chat ? String(snip.chat) : ''
+    const src = chat ? `${srcRaw}:${chat}` : srcRaw
+    const who = snip?.from ? String(snip.from) : ''
+    const head = who ? `[${src}] ${who}` : `[${src}]`
+    const body = snip?.body ? String(snip.body).trim() : ''
+    if (body) {
+      parts.push(`${head}：${body}`, `（${addr}）`)
     } else {
-      parts.push(`[zero-memcp] 新输入${from}`, `  ${addr}`, '')
+      parts.push(`${head} 有新消息`, `（${addr}）`)
     }
   }
-
-  parts.push('用 mem 读全文（read <地址>）。处理完清除条目；要不要记进自己的记忆由你判断。')
-  return parts.join('\n')
+  return parts.join('\n\n')
 }
 
 /** memcp://BlackEggAI%2Fzero/inbox → BlackEggAI/zero@inbox */
@@ -315,4 +337,69 @@ export function renderPending(events) {
     ...lines,
     '</memory_updates>',
   ].join('\n')
+}
+
+
+/**
+ * 把一条记忆拆成「信封 + 正文」。
+ *
+ * 信封是写入方写在正文开头的 key: value 行（source/chat/from/id），
+ * 它和 zero-memcp 自带的元数据（created/session/endpoint）混在一起，
+ * 所以先按顺序收 kv，遇到第一个不匹配的行就算正文开始。
+ */
+export function parseEntry(text) {
+  const raw = String(text || '')
+  // 形态一：qqmcp 投递格式（带 === 新消息开始 === 标记）
+  //
+  // 实测（2026-11-12）：qqmcp 写入的信封头部是 frontmatter（--- source: qqmcp-inbox ... ---），
+  // 真正的正文包在 === 新消息开始 === 与 === 新消息结束 === 之间。
+  // 旧代码遇到第一个 --- 就以为正文开始了，把整个 inbox/qq ... 连带
+  // 上下文全当成 body，甚至在第一道空行前只认出 source: qqmcp-inbox，
+  // 发送者和正文全空——于是提示词只能退化成「[外部] 有新消息」，
+  // 看起来像「推送没带内容」。
+  const mNews = /=== 新消息开始 ===\s*\n([\s\S]*?)\n\s*=== 新消息结束 ===/.exec(raw)
+  const mFrom = /\bfrom=([^\s\n]+)/.exec(raw)
+  const mSrc = /\bsrc=([a-z]+):/.exec(raw)
+  if (mNews) {
+    // src 的形状是 group:<gid> / private:<uid>，来源渠道是 qq 而不是「group」。
+    // 名字后缀的 (uin) 对人间对话没用，提示词里只留名字。
+    const kind = mSrc ? mSrc[1] : ''
+    const mChat = /\bsrc=(?:group|private):([\w-]+)/.exec(raw)
+    const source = kind === 'group' || kind === 'private' ? 'qq' : (kind || 'qq')
+    const who = mFrom ? mFrom[1].replace(/\s*\(\d+\)\s*$/, '') : ''
+    return {
+      source,
+      chat: mChat ? mChat[1] : '',
+      from: who,
+      body: mNews[1].trim().slice(0, 400),
+    }
+  }
+
+  // 形态二：标准信封格式（以 --- 分割，或 key: value 抬头）
+  const lines = raw.split('\n')
+  const kv = {}
+  let bodyAt = 0
+  let inFm = false
+  for (let i = 0; i < lines.length && i < 20; i++) {
+    const line = lines[i].trim()
+    if (line === '---') {
+      if (!inFm) { inFm = true; continue }
+      bodyAt = i + 1
+      break
+    }
+    if (!line) continue
+    const m = /^([A-Za-z_][\w-]*)\s*:\s*(.*)$/.exec(line)
+    if (m) kv[m[1].toLowerCase()] = m[2].trim()
+    else if (!inFm) break
+    bodyAt = i + 1
+  }
+  const srcRaw = (kv.src || kv.source || '').toLowerCase()
+  const known = ['qq', 'wechat', 'tieba', 'mail', 'rss', 'telegram']
+  const source = known.find((x) => srcRaw.includes(x)) || (kv.src ? srcRaw : '外部')
+  return {
+    source,
+    chat: kv.chat || kv.thread || kv.room || '',
+    from: kv.from || kv.user || kv.sender || '',
+    body: lines.slice(bodyAt).join('\n').trim().slice(0, 600),
+  }
 }

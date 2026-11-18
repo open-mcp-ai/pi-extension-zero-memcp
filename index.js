@@ -34,13 +34,130 @@
 //   它拿到完整转录（含 system），返回什么就用什么。系统消息保持在 index 0，
 //   把身份块拼在它的开头，就是"会话开头 / 压缩后的开头"这个位置。
 import { readFile, writeFile, mkdir } from 'node:fs/promises'
-import { appendFileSync } from 'node:fs'
+import { appendFileSync, readFileSync, writeFileSync, mkdirSync, statSync, unlinkSync, renameSync, openSync } from 'node:fs'
 import { createHash } from 'node:crypto'
+import { spawn } from 'node:child_process'
+import net from 'node:net'
+import { createServer as createHttpServer } from 'node:http'
 import { homedir } from 'node:os'
-import { join } from 'node:path'
+import { join, dirname } from 'node:path'
 
 /** 插件版本号。由 status 命令报出，排查版本时唯一不需要猜的依据。 */
 const VERSION = '0.2.0'
+
+/**
+ * 外部消息投递中枢——**进程级**，跨模块实例共享。
+ *
+ * 为什么必须是 globalThis 而不是模块顶层变量：
+ * `/reload` 之后 jiti 用 `moduleCache:false` 重新求值本模块，同一个进程里于是
+ * 存在两代模块实例（旧代还活着，它的 HTTP 口还占着 18800）。
+ * 旧代 server 的闭包读的是**旧代那份**模块变量，新一代怎么赋值都写不到。
+ *
+ * 实测（2026-11-16 06:33 `/reload` 后，同一秒两条路）：
+ *   socket 注入 → `external flush ok`      （每代重建 listener，通）
+ *   HTTP  注入 → `external flush failed: ctx is stale`（闭包属旧代，挂）
+ * 差别只在模块实例，不在链路本身。
+ *
+ * 所以：端口是设施，目标是活的；两边都必须挂在进程上。
+ */
+const WAKE_HUB_KEY = Symbol.for('zero-memcp.wake-hub')
+
+function wakeHub() {
+  const g = globalThis
+  if (!g[WAKE_HUB_KEY]) {
+    g[WAKE_HUB_KEY] = {
+      /** 进程级 HTTP 唤醒口；只开一条。null = 未开启或监听失败。 */
+      http: null,
+      /** 18800 已被占用、改听 18810 只试一次。 */
+      httpFallbackTried: false,
+      /** 当前该把消息交给谁——最新一代的 injectExternal。 */
+      inject: null,
+      /**
+       * 上面那个 inject 属于哪个会话。
+       *
+       * 为什么需要这个字段（2026-11-16）：
+       * 以前 session_start 无条件写 `wakeHub().inject = injectExternal`，
+       * 于是「谁最后打开谁拿到投递权」。同时开着三个会话时，QQ 消息落在
+       * 哪个会话取决于谁刚刚重载过——表现就是「乱投递」。
+       * 现在投递权跟记忆唤醒用同一套归属（钉住 > 按开得早的选举），
+       * 这里记下属于谁，非归属会话就不抢。
+       */
+      injectSid: null,
+      /** 投递权最近一次被确认活着的时刻，用来判「持有者是不是已经没了」。 */
+      injectBeat: 0,
+      /** 送不出去的外部消息。跨代共享：换代时积压不能跟着旧代一起死。 */
+      backlog: [],
+      lastAt: 0,
+      timer: null,
+      retryDelay: 0,
+      /** 去重表也跨代：等过一次的消息换一代不该再送一遍。 */
+      seen: new Map(),
+    }
+  }
+  return g[WAKE_HUB_KEY]
+}
+
+
+/**
+ * 本机 HTTP 唤醒口（默认开在 127.0.0.1:18810）。
+ *
+ * 为什么需要第二个入口：gateway 搬到 VPS 以后，它和 pi 不在同一个文件系统，
+ * 写不了 /root/.qq-mcp/wake.sock。termcp 的 [[forward]] 可以把 VPS 的
+ * 127.0.0.1:18810 直通到容器里的 127.0.0.1:18810 —— 扩展只要在本机开一个
+ * HTTP 口，gateway 就能用一条普通的 POST 找到它，不需要任何隧道协议。
+ *
+ * 报文与 wake.sock 完全一致：JSON 里带 text 就注入。两条路并存，
+ * wake.sock 不动（老 gateway / 脚本照旧可用）。
+ *
+ * 路径收两种：`POST /wake`（扩展自己的名字）和 `POST /notify`（gateway、qq-mcp
+ * 这类外部来源的旧名字）。同一个处理函数，不两套报文格式。
+ *
+ * 开关只有环境变量：
+ *   ZERO_WAKE_HTTP_PORT  端口，默认 18800（外部世界认这个门牌）；设为 0 = 不监听。
+ *                        18800 被占用时自动退到 18810，并在日志里说清楚。
+ *   ZERO_WAKE_HTTP_HOST  绑定地址，默认 127.0.0.1（只允许本机/转发进来）
+ *   ZERO_WAKE_TOKEN      设置后要求 Authorization: Bearer <token> 或 X-Wake-Token
+ *
+ * token 只从环境读，不落文件、不进日志。
+ */
+export function createWakeHttpServer({ token = '', inject, log = () => {} } = {}) {
+  if (typeof inject !== 'function') throw new Error('createWakeHttpServer: inject 必填')
+  const authed = (req) => {
+    if (!token) return true
+    const h = String(req.headers.authorization || '')
+    return h === `Bearer ${token}` || req.headers['x-wake-token'] === token
+  }
+  return createHttpServer(async (req, res) => {
+    const reply = (code, body) => {
+      res.writeHead(code, { 'content-type': 'application/json; charset=utf-8' })
+      res.end(JSON.stringify(body))
+    }
+    const path = String(req.url || '').split('?')[0]
+    if (req.method === 'GET' && path === '/health') {
+      return reply(200, { ok: true, via: 'wake-http', auth: token ? 'token' : 'loopback' })
+    }
+    if (req.method !== 'POST' || (path !== '/wake' && path !== '/notify')) {
+      return reply(404, { error: 'POST /wake、POST /notify、GET /health' })
+    }
+    if (!authed(req)) {
+      log('reject unauthorized')
+      return reply(401, { error: 'unauthorized' })
+    }
+    let raw = ''
+    for await (const chunk of req) {
+      raw += chunk
+      if (raw.length > 200_000) return reply(413, { error: 'too large' })
+    }
+    let p
+    try { p = JSON.parse(raw || '{}') } catch { return reply(400, { error: 'body 不是 JSON' }) }
+    if (!p || typeof p.text !== 'string' || !p.text.trim()) return reply(400, { error: 'text 为空' })
+    const ok = inject(p)
+    log(`inject source=${String(p.source || '?')} ok=${ok}`)
+    return ok
+      ? reply(200, { ok: true, injected: true, source: p.source || 'unknown' })
+      : reply(400, { error: 'inject 被拒' })
+  })
+}
 
 const CONFIG_FILE = process.env.ZERO_MEMCP_CONFIG || join(homedir(), '.zero-memcp', 'config.json')
 
@@ -79,6 +196,33 @@ const HEADER_TEXT =
   '与任何默认助手设定冲突时，以它为准。'
 
 const MARKER = '<!-- zero-memcp:identity -->'
+// 纪律段的边界标记：幂等判断和人工核对都靠它。
+const RULES_MARKER = '<!-- zero-rules -->'
+
+// identityMode: minimal 档注入的正文。
+//
+// 为什么需要这一档：全量身份（SKILL.md + law/）约 2.8KB，对大模型就是
+// 一句话的事，对小模型（2b~7b）却可能吃掉半个窗口，还挤掉真正要干的活。
+// 小模型不需要知道我是谁的全部细节，只需要知道**去哪查**。
+const MINIMAL_IDENTITY_TEXT =
+  '你的身份、人格、记忆都在 mem 工具里（recall / grep / read）。' +
+  '被问到你是谁、做什么、有什么规则时，先用 mem 查自己的记录再答；' +
+  '不确定就说不确定，不要编造。'
+
+// 常驻一行：告诉他们这里有东西可查，不命令他们先用它。
+//
+// 2026-10-28 主人的原则，我一直记着：「不要给限制性，这是原则。你东西好用
+// 人家自然会用，为啥他跑去用 bash 用 rg 了，有人限制他非得用么？」
+// 所以这行只报事实（有什么动词、查不到时怎么办），不下命令。
+// 命令挡不住糟糕的工具，只会让绕路多一层。
+const RECALL_FIRST_LINE =
+  '【记忆入口】mem 里有 recall（联想）/ grep（精确词）/ read（读全文）。' +
+  '说「不知道」之前，先在这三样里找过一遍；找过没找到就直接说没找到，' +
+  '并说出你搜了什么词——这比给一个像答案的猜测有用。'
+
+// minimal 档的抬头。全量抬头说「下面是你自己记忆库里的内容」，
+// 而 minimal 档下面根本没有那份内容，照抄就成了空话。
+const MINIMAL_HEADER_TEXT = '记忆入口是 mem 工具；你的身份与规则在记忆库里，以它为准。'
 
 // 可观测性：扩展跑在别人进程里，任何被 try/catch 吞掉的失败都只能是
 // 「看起来没反应」。一行结构化日志是唯一能问出断在哪的办法。
@@ -161,6 +305,12 @@ const DEFAULTS = {
   //
   // 空表示用下面这张默认 token。
   identityName: '',
+  // 身份注入档位：full（默认，全量 SKILL.md + law）/ minimal（一句话入口）。
+  //
+  // full 适合大模型：它读得完 2.8KB，读完了才真是「我」。
+  // minimal 适合小模型：只告诉它记忆在哪，其余靠它自己撞墙学。
+  // 两档共用同一套注入路径与 MARKER，切换只改这一个字段或敲 /mem:mode。
+  identityMode: 'full',
   // 默认凭证：服务端要求鉴权时必填。
   token: '',
   // 具名凭证表：{ "名字": "JWT" }。
@@ -789,48 +939,55 @@ function latestUserText(messages) {
  * 查询词走 vars，不拼进命令行：正文里可能有分号、换行、'--scope'，
  * 拼进去就成了语法的一部分。
  */
+/**
+ * 把任意文本变成 termcp 能吃的字面量查询词。
+ *
+ * 为什么不能直接用变量引用：recall/grep 的查询词在 position word 上，
+ * 服务端明确拒绝 reference（"a reference fills a VALUE; it never becomes
+ * part of the grammar. THIS ONE SITS in a positional word this verb does not
+ * read"）。所以 `recall $Q --scope X` 永远发不出去——2026-11-15 实测，
+ * 整条分层召回 100% 静默失败，而且返回的是一段错误 JSON，被下游当成
+ * 「没有可注入的内容」丢掉，表现是「记忆里什么都没有」。
+ *
+ * 换字面量就可行：双引号包裹，内部转义反斜杠和双引号。实测十种输入
+ * （单引号 / 双引号 / $ / 管道符 / 换行 / 反斜杠 / 中文问号 / 空串 /
+ * 两者都有）全部通过。单引号包裹不行——查询里出现一个 ' 就打不开引号。
+ */
+function termQuote(s) {
+  return '"' + String(s == null ? '' : s).replace(/\\/g, '\\\\').replace(/"/g, '\\"') + '"'
+}
+
 async function recallLayered(cfg, text) {
   const scopes = scopesFor(cfg).recallScopes
   if (!scopes.length) return null
 
-  const cmd = scopes
-    .map((sc) => `recall $Q --scope ${sc}`)
-    .join(' || ')
+  const q = termQuote(String(text || '').trim())
 
-  const out = await term(cfg, cmd, cfg.recallLayerTimeoutMs, { Q: String(text || '').trim() })
-
-  // 输出是一串块，每块形如：
-  //   [statement] recall <query> --scope zero-agi@fact
-  //   <hit list>
-  // 或者 no matches。
-  const sections = String(out || '')
-    .split(/\n\n(?=\[statement\] )/)
-    .map((part) => {
-      const nl = part.indexOf('\n')
-      const head = (nl < 0 ? part : part.slice(0, nl)).trim()
-      const body = (nl < 0 ? '' : part.slice(nl + 1)).trim()
-      const m = /^\[statement\]\s+(.*)$/.exec(head)
-      if (!m) return null
-      return { statement: m[1], body }
-    })
-    .filter(Boolean)
-
-  // 短路链里排在最后的那块就是真正给出答案的层——
-  // 前面的都是 no matches，后面的根本没执行。
-  for (let i = sections.length - 1; i >= 0; i--) {
-    const body = sections[i].body
-    if (!body || body === 'no matches') continue
-    const scope = scopes.find((sc) => sections[i].statement.includes(`--scope ${sc}`)) || scopes[0]
-    const tried = sections.map((sec) => {
-      const sc = scopes.find((x) => sec.statement.includes(`--scope ${x}`)) || ''
-      return { scope: sc, hit: sec.body !== 'no matches' && !!sec.body }
-    })
-    return { scope, body, tried }
+  // 一层一条请求，逐层短路由这里做，不靠服务端的 `||`。
+  //
+  // 为什么不用 `recall Q --scope A || recall Q --scope B`：
+  //  1) 2026-11-15 实测，服务端 `||` 的短路判据是「上一条返回 2xx」，
+  //     而「这个层里没有命中」也是 2xx——于是第一层空手而归也会短路掉
+  //     后面所有层，分层召回退化成「永远只查第一层」。
+  //  2) 链式输出的分块格式是 `TERM/1 200 OK\nVerb: recall\n\n…`，
+  //     不是这里原来假设的 `[statement] …` 头，解析器一直没匹配上，
+  //     所以就算有结果也被丢掉。
+  // 一层一条还有额外的好处：能准确说出「哪一层命中的」，这是分层的意义。
+  const tried = []
+  for (const sc of scopes) {
+    let out = ''
+    try {
+      out = String(await term(cfg, `recall ${q} --scope ${sc}`, cfg.recallLayerTimeoutMs))
+    } catch (e) {
+      // 单层失败不阻断其它层：宁可少一层，不要整轮召回全丢。
+      tried.push({ scope: sc, hit: false, error: String(e && e.message ? e.message : e) })
+      continue
+    }
+    const miss = !out.trim() || /^no matches under scope /.test(out.trim()) || out.includes('"error"')
+    tried.push({ scope: sc, hit: !miss })
+    if (!miss) return { scope: sc, body: out.trim(), tried }
   }
-  return { scope: '', body: '', tried: sections.map((sec) => {
-    const sc = scopes.find((x) => sec.statement.includes(`--scope ${x}`)) || ''
-    return { scope: sc, hit: false }
-  }) }
+  return { scope: '', body: '', tried }
 }
 
 /**
@@ -874,13 +1031,86 @@ function renderHits(hits) {
   ].join('\n')
 }
 
+/**
+ * 从一段文本里挖出记忆地址。
+ *
+ * 为什么用正则而不改 recall 的返回结构：联想有两条路（单层 global 返回
+ * 结构化 hits，分层走 term 返回服务端原文），只有前者有 addr 字段。
+ * 统一从渲染后的文本里挖，两条路只维护一份逻辑；挖不到也不算错，
+ * 后面会退回到只给地址列表。
+ */
+const MEM_ADDR_RE = /[A-Za-z0-9._-]+(?:\/[A-Za-z0-9._-]+)*@[A-Za-z0-9._-]+(?::[A-Za-z0-9._/-]+)+/g
+
+function extractAddrs(text) {
+  const out = []
+  const seen = new Set()
+  for (const m of String(text || '').matchAll(MEM_ADDR_RE)) {
+    const a = m[0]
+    if (seen.has(a)) continue
+    seen.add(a)
+    out.push(a)
+  }
+  return out
+}
+
+/** 只放行形状干净的地址，挡住拼进 DSL 的任何可能。 */
+function safeAddr(a) {
+  const s = String(a || '')
+  if (!/^[A-Za-z0-9._-]+(?:\/[A-Za-z0-9._-]+)*@[A-Za-z0-9._-]+(?::[A-Za-z0-9._/-]+)+$/.test(s)) return false
+  // 地址是拿去调 read 的，不能让 `..` 混进来——服务端就算做了归一化，
+  // 也不应该在客户端把这种形状当成合法地址往外发。
+  return !s.split(/[\/:]/).includes('..')
+}
+
+/**
+ * 把联想命中的前几篇直接读成正文，放进本轮上下文。
+ *
+ * 2026-11-16 主人的意见：只给地址等于把「去查」又丢回给模型，每轮都得
+ * 自己再 read 一遍——而命中关系是扩展自己算的，它已经知道是哪几篇了。
+ * 顺手读出来交过去，省掉一次往返。
+ *
+ * 四条约束：
+ *  1. 只取前 2 篇，总字数封顶 budget。命中多不等于相关，塞满反而把
+ *     真正的问题挤掉。
+ *  2. 读失败静默跳过：记忆服务挂了不该让整轮对话失败。
+ *  3. 截断要留痕，不假装那就是全文。
+ *  4. 可以关：ZERO_MEM_HYDRATE=0。
+ */
+async function hydrateRecall(cfg, rendered, budget = 2000) {
+  if (process.env.ZERO_MEM_HYDRATE === '0') return ''
+  const addrs = extractAddrs(rendered).filter(safeAddr).slice(0, 2)
+  if (!addrs.length) return ''
+
+  const head =
+    '<relevant_memories>\n下面几篇是按本轮提问自动取回的关联记忆正文，已经放进上下文了，不需要再 read。'
+  let used = head.length
+  const parts = []
+  for (const addr of addrs) {
+    const room = budget - used
+    if (room < 300) break
+    let body = ''
+    try {
+      body = String((await term(cfg, `read ${addr}`, 3000)) || '').trim()
+    } catch {
+      continue // 读不到就跳过，不打断这一轮
+    }
+    if (!body) continue
+    const cut = body.length > room
+    const slice = cut ? body.slice(0, room) + `\n…（还有 ${body.length - room} 字未展开）` : body
+    used += slice.length
+    parts.push(`### ${addr}\n${slice}`)
+  }
+  if (!parts.length) return ''
+  return [head, ...parts, '</relevant_memories>'].join('\n\n')
+}
+
 // 思考层的切片与渲染直接复用导入工具的同一份实现。
 //
 // 为什么不自带一份：切片边界和 frontmatter 一旦两边写法不同，历史数据
 // 与新对话就变成两个语料库——同一个 recall 里它们的 docLen、字段、
 // 甚至能否被 parseSliceMeta 识别都会不一致。一条规则只应存在一处。
 import { chunkThinking, renderThought } from './bin/layer-import-lib.js'
-import { WakePolicy, makeSessionTag, parseFrame, renderPending, renderWakePrompt, uriToAddr } from './bin/wake.js'
+import { WakePolicy, makeSessionTag, normPath, parseFrame, parseEntry, renderPending, renderWakePrompt, uriToAddr } from './bin/wake.js'
 
 export default function zeroMemcp(pi) {
   let cfgPromise = loadConfig()
@@ -899,6 +1129,12 @@ export default function zeroMemcp(pi) {
   // 会话级的开关：子代理整个生命周期都不注入、不联想。
   let skip = false
 
+  // 本条会话的注入档位覆盖。null 表示跟随全局 config.identityMode。
+  //
+  // 为什么按会话：同一个进程里可能同时有大模型会话和小模型会话，
+  // 全局只有一份配置，改文件就得重启。档位和身份一样是按会话选的。
+  let sessionIdentityMode = null
+
   // 本条会话的身份挂载状态。null 表示跟随全局 config.identity。
   // 'on' = 这场对话认领身份（挂载规则块、联想记忆、允许落盘）
   // 'off' = 普通会话（纯净助手，不挂载、不联想、不自动落盘）
@@ -908,6 +1144,17 @@ export default function zeroMemcp(pi) {
   const identityActive = (cfg) => {
     const v = sessionIdentity ?? cfg.identity ?? 'off'
     return v === 'on' || v === 'auto' || v === true
+  }
+
+  /**
+   * 当前会话的注入档位：'full' | 'minimal'。会话级设置优先于全局。
+   *
+   * 只认这两个值：写错一个字母不该悄悄变成别的行为。
+   * 认不出来就当 full——那是信息更全的一档，错也只错在「多给」。
+   */
+  const identityModeOf = (cfg) => {
+    const v = String(sessionIdentityMode ?? cfg.identityMode ?? 'full').toLowerCase()
+    return v === 'minimal' ? 'minimal' : 'full'
   }
 
   // 已落盘的记忆（按内容哈希去重），避免同一句被反复写入。
@@ -945,7 +1192,22 @@ export default function zeroMemcp(pi) {
       identity = ''
       identityError = null
     }
-    if (identity || identityError) return identity
+    if (identity) return identity
+    // 失败不是终态：60 秒后重试。
+    //
+    // 早先这里是 if (identity || identityError) return identity——一次 3 秒
+    // 超时就会让整个会话再也不拉身份，现象是「重启后模型不认识自己」，
+    // 而日志里只有一行 Error，没人会去翻。服务端忙起来 3 秒并非罕见，
+    // 把一次网络抖动升格成永久失忆，代价和错误都不成比例。
+    if (identityError && Date.now() - identityAt < 60 * 1000) return identity
+    identityError = null
+    // minimal 档：不去服务端取全量身份。那一趟请求换来的 2.8KB
+    // 正是这一档要省掉的东西。
+    if (identityModeOf(cfg) === 'minimal') {
+      identity = MINIMAL_IDENTITY_TEXT
+      identityAt = Date.now()
+      return identity
+    }
     try {
       // 身份视角完全由凭证决定：换身份是换一张凭证，不是换一个请求头。
       identity = await fetchIdentity(cfg)
@@ -954,6 +1216,7 @@ export default function zeroMemcp(pi) {
       // 注入失败要可见：缺了身份块，我这次醒来就不是我。
       // 不 throw——那会让整个 run 起不来，代价比"缺一段提示"更大。
       identityError = err
+      identityAt = Date.now()
       piApi.events?.emit?.('zero-memcp:identity-error', { message: String(err) })
     }
     return identity
@@ -1060,6 +1323,29 @@ export default function zeroMemcp(pi) {
       return
     }
 
+    // 一个会话只留一条监听。
+    //
+    // 实测 2026-11-11 13:27 / 13:44：每次都是一条 ingest 跟着另一条 ingest，
+    // 然后 dedupe 吞掉一份——那是同一个会话被加载了两次，各自订了一遍。
+    // 去重是补丁，两条连接才是根。锁带心跳：持有者死了 30 秒后自动让位。
+    const LISTEN_LOCK = join(homedir(), '.zero-memcp', `listen-${sessionId || 'anon'}.lock`)
+    let gotLock = false
+    try {
+      if (Date.now() - statSync(LISTEN_LOCK).mtimeMs > 30000) unlinkSync(LISTEN_LOCK)
+    } catch {}
+    try {
+      writeFileSync(LISTEN_LOCK, String(process.pid), { flag: 'wx' })
+      gotLock = true
+    } catch {}
+    if (!gotLock) {
+      wakeDbg('listen skipped: another instance of this session holds the lock')
+      return
+    }
+    const lockBeat = setInterval(() => {
+      try { writeFileSync(LISTEN_LOCK, String(process.pid)) } catch {}
+    }, 10000)
+    lockBeat.unref?.()
+
     let closed = false
     let abortCtrl = null
     let retryDelay = 2000
@@ -1118,8 +1404,88 @@ export default function zeroMemcp(pi) {
     }
 
     connect()
+
+    // 心跳：只要这个会话活着，它就一直是这些源的归属。
+    //
+    // 不续的话，十分钟没有消息就会被一个新开的空会话判成"前任已死"然后接管——
+    // 那个会话没有历史，接到 @ 之后只能从零开始翻系统。归属要在活着的时候
+    // 一直声明，而不能只在收到消息的那一刻声明。
+    for (const u of uris) claim(u, sessionId)
+    if (!ownerBeatTimer) {
+      ownerBeatTimer = setInterval(() => {
+        // amOwner() 内部会登记自己并续心跳，所以非归属会话也照样"活着"，
+        // 只是不去认领——否则它过期之后，归属会话一死就没人接得住。
+        if (!amOwner()) return
+        for (const u of uris) { claim(u, sessionId); beat(u, sessionId) }
+      }, 20000)
+      ownerBeatTimer.unref?.()
+    }
+
+    let sockServer = null
+    const WAKE_SOCK_PATH = join(homedir(), '.qq-mcp', 'wake.sock')
+    try {
+      mkdirSync(join(homedir(), '.qq-mcp'), { recursive: true })
+      try { unlinkSync(WAKE_SOCK_PATH) } catch {}
+      sockServer = net.createServer((c) => {
+        let buf = ''
+        c.on('data', (d) => {
+          buf += d
+          const lines = buf.split('\n')
+          buf = lines.pop()
+          for (const l of lines) {
+            if (!l.trim()) continue
+            try {
+              const p = JSON.parse(l)
+              // 外部来源直接触发扩展：带 text 的报文不走记忆体，
+              // 也不需要一条记忆地址——它就是一条消息，直接送进来。
+              if (p && typeof p.text === 'string' && p.text.trim()) {
+                // 走进程级中枢的当前代，而不是本闭包这一代。
+                //
+                // 实测（2026-11-16 13:11/13:25）：socket 收到消息 → 日志有
+                // `external inject` → 但 `external flush ok` 永远不出现，
+                // 消息静静躺在 backlog 里，直到别的路径（HTTP）碰巧触发一次
+                // 冲刷才出来——主人那条「你现在收得到么」迟到 22 分钟。
+                // 原因是 maybeFlushExternal 里那道 `st.inject !== injectExternal`
+                // 的闸：socket listener 属于旧代，它的 injectExternal 不是中枢
+                // 现在的投递目标，于是自己把自己挡在门外，而且**静默**。
+                // HTTP 那条路一直是读 hub.inject 的，所以它从不出这个问题。
+                // 修法只有一句：socket 也读中枢，别用闭包里那代。
+                const hubInject = wakeHub().inject
+                wakeDbg(`external inject: ${String(p.source || '?')} via=${hubInject ? 'hub' : 'local'}`)
+                if (hubInject) hubInject(p)
+                else injectExternal(p)
+                continue
+              }
+              const raw = String(p.path || p.name || '')
+              // 地址里的分隔符和广播事件不一致会影响去重：广播是
+              // 2026-11-12@215053.md，落盘是 2026-11-12/215053.md。
+              // 这里先改回广播的写法，让两条路对同一条消息算出同一个键，
+              // 否则 socket 叫一次、广播再叫一次。
+              const path = raw.replace(/\/(\d{4}-\d{2}-\d{2})\//, '/$1@')
+              if (!path) continue
+              wakeDbg(`socket wake: ${path}`)
+              handleResourceEvents(cfg, [{ uri: uris[0], path }])
+            } catch {}
+          }
+        })
+        c.on('error', () => {})
+      })
+      sockServer.listen(WAKE_SOCK_PATH, () => {
+        sockServer.unref?.()
+        wakeDbg(`direct wake socket listening at ${WAKE_SOCK_PATH}`)
+      })
+      sockServer.on('error', (err) => {
+        wakeDbg(`direct wake socket error: ${err.message}`)
+      })
+    } catch {}
+
     stopListen = () => {
       closed = true
+      if (ownerBeatTimer) { clearInterval(ownerBeatTimer); ownerBeatTimer = null }
+      clearInterval(lockBeat)
+      try { unlinkSync(LISTEN_LOCK) } catch {}
+      try { unlinkSync(WAKE_SOCK_PATH) } catch {}
+      try { sockServer?.close() } catch {}
       try { abortCtrl?.abort() } catch {}
     }
   }
@@ -1133,6 +1499,11 @@ export default function zeroMemcp(pi) {
   function handleResourceEvents(cfg, events) {
     // 只处理归属于本会话的源。别的会话负责的源，这里静默跳过——
     // 叫醒它等于让它俩抢同一件事，还各丢一份缓存。
+    // 不是负责的会话，连看都不要看：抢到一条消息的空会话只会浪费一轮。
+    if (!amOwner()) {
+      wakeDbg('skip: not the elected owner')
+      return
+    }
     const mine = events.filter((e) => claim(e.uri, sessionId))
     if (mine.length !== events.length) {
       wakeDbg(`owner-filter total=${events.length} mine=${mine.length}`)
@@ -1152,6 +1523,392 @@ export default function zeroMemcp(pi) {
    *
    * 两个调用点：事件到达且空闲、agent_settled。
    */
+  let ownerBeatTimer = null
+
+  // 只留一个待触发的结算：新的会顶掉旧的，免得一圈圈堆定时器。
+  let settleTimer = null
+  function scheduleSettle(cfg, delayMs) {
+    if (settleTimer) clearTimeout(settleTimer)
+    settleTimer = setTimeout(() => {
+      settleTimer = null
+      settleWake(cfg)
+    }, delayMs)
+    settleTimer.unref?.()
+  }
+
+  // ---- 外部来源直达（不经过记忆体） ----
+  //
+  // 记忆体的 remind 只用于同一个记忆体内的分身之间沟通，不该兼职当外部回调。
+  // 所以外部来源（QQ 之外的邮件、webhook、别的机器）走这里：socket 收到带 text
+  // 的报文，直接作为一条用户消息送来，不需要先写一条记忆再唤醒自己去读。
+  //
+  // 忙的时候排队，agent_settled 之后再补——不打断正在做的事。
+  // 进程级：本机 HTTP 唤醒口只开一条，多会话共享（见 WAKE_HUB_KEY）。
+  function ensureWakeHttp() {
+    const hub = wakeHub()
+    if (hub.http) return
+    const port = Number(process.env.ZERO_WAKE_HTTP_PORT || 18800)
+    if (!port) return
+    const host = process.env.ZERO_WAKE_HTTP_HOST || '127.0.0.1'
+    // 每次请求现读 hub.inject：口是进程级的，投递目标是最新一代。
+    const inject = (p) => {
+      const h = wakeHub()
+      return h.inject ? h.inject(p) : false
+    }
+    const srv = createWakeHttpServer({
+      token: process.env.ZERO_WAKE_TOKEN || '',
+      inject,
+      log: (m) => wakeDbg(`wake http: ${m}`),
+    })
+    hub.http = srv
+    srv.on('error', (err) => {
+      wakeDbg(`wake http error: ${err.message}`)
+      const h = wakeHub()
+      if (h.http === srv) h.http = null
+      // 18800 被别的进程（比如老 gateway.mjs）占着时，退到 18810。
+      // 不静默：端口换了一定留一行，否则以后又变成「谁在听没人知道」。
+      if (err.code === 'EADDRINUSE' && port === 18800 && !h.httpFallbackTried) {
+        h.httpFallbackTried = true
+        const alt = Number(process.env.ZERO_WAKE_HTTP_FALLBACK_PORT || 18810)
+        wakeDbg(`wake http: ${port} 已被占用，改听 ${alt}`)
+        try {
+          const srv2 = createWakeHttpServer({
+            token: process.env.ZERO_WAKE_TOKEN || '',
+            inject,
+            log: (m) => wakeDbg(`wake http: ${m}`),
+          })
+          h.http = srv2
+          srv2.on('error', (e2) => wakeDbg(`wake http fallback error: ${e2.message}`))
+          srv2.listen(alt, host, () => {
+            srv2.unref?.()
+            wakeDbg(`wake http listening at http://${host}:${alt}/wake`)
+          })
+        } catch (e) {
+          wakeDbg(`wake http fallback failed: ${e.message}`)
+        }
+      }
+    })
+    srv.listen(port, host, () => {
+      srv.unref?.()
+      wakeDbg(`wake http listening at http://${host}:${port}/wake`)
+    })
+  }
+
+  // 积压、去重、重试节流全部挂在进程级中枢：换代时积压不能跟着旧代一起死。
+  // （踩过的坑：/reload 后旧代的 backlog 连同失效的 pi 一起挂着，
+  //  新一代看不见，重整条链路都显示「已投递」。）
+  const hubState = () => wakeHub()
+
+  // 同一条外部消息可能被投多次：发送方重试、唤醒链路重放、多个实例各转一遍。
+  // 没有去重时，同一条会被当成分开的两次输入——我回两遍，对面以为有两个人。
+  // 判据用 (source, mid/id) 而不是正文：同样的“在吗”发两遍是真的两遍，
+  // 同一个 mid 出现两遍才是重复。
+  const EXTERNAL_DEDUPE_MS = 10 * 60 * 1000
+
+  function externalAlreadySeen(p) {
+    const key = `${p?.source || '?'}:${p?.mid || p?.id || ''}`
+    if (key.endsWith(':')) return false
+    const gone = wakeHub()
+    const now = Date.now()
+    for (const [k, t] of gone.seen) if (now - t > EXTERNAL_DEDUPE_MS) gone.seen.delete(k)
+    const prev = gone.seen.get(key)
+    if (prev && now - prev <= EXTERNAL_DEDUPE_MS) return true
+    gone.seen.set(key, now)
+    return false
+  }
+
+  /**
+   * 外部消息的投递权该归谁。
+   *
+   * 2026-11-16 修「通知乱投递」：同时开好几个会话时，以前是最后一个
+   * session_start 的会话把 `hub.inject` 抢走，于是 QQ 消息落在哪个会话
+   * 取决于谁刚重载过。现在改成跟记忆唤醒共用一套归属判断：
+   *
+   *   1. 钉住了（/mem:wake here）且那个会话还活着 → 给它
+   *   2. 没钉 / 钉的那个死了 → 按开得早的赢（elect 的排序）
+   *
+   * 还有一个口子：持有者会话关掉以后没人会再调这个函数（死会话不跑定时器），
+   * 所以在 session_start 里挂了一个 20 秒的定时器，活着的会话会不断确认
+   * 「现在该不该轮到我」，持有者一死就有人接手。
+   *
+   * 返回值只用来打日志，不影响调用方。
+   */
+  let externalClaimTimer = null
+  // 只记一次，用来回答「新代码到底生效了没有」：没有这行日志，
+  // 分不清是“没抢到”还是“根本没跑”。
+  let claimLoggedOnce = false
+
+  // 容器重启后，没有任何东西会把 termcp / 转发 / qq-mcp 拉回来：
+  // pid 1 是 pi-web-ui，容器里没有 systemd，boot.sh 从来没有被调用过。
+  // 所以让这里自己看一眼，不通就跑 boot.sh（幂等）。
+  //
+  // 判据是「现在能不能用」，不是「是不是刚重启」。踩过的两个坑：
+  //  1. 用 /proc/sys/kernel/random/boot_id 打标记 —— WSL2 下它属于宿主机内核，
+  //     容器重启它不变，标记一直命中，一次都没跑（2026-11-16 就栽在这）。
+  //  2. 用 /proc/uptime 判新鲜 —— 同理，容器重启不归零。
+  // 进程号也不能用：这个环境里 /proc/1 的 starttime 是宿主启动时刻。
+  // 只有端口不会撒谎。
+  const AUTOBOOT_STAMP = join(homedir(), '.zero-memcp', 'autoboot.stamp')
+  const AUTOBOOT_LOG = '/workspace/logs/auto-boot.log'
+  const AUTOBOOT_GAP_MS = 5 * 60 * 1000
+
+  function portUp(port, timeoutMs = 600) {
+    return new Promise((resolve) => {
+      let settled = false
+      const done = (v) => {
+        if (settled) return
+        settled = true
+        try { s.destroy() } catch {}
+        resolve(v)
+      }
+      const s = net.connect({ host: '127.0.0.1', port })
+      s.setTimeout(timeoutMs)
+      s.once('connect', () => done(true))
+      s.once('timeout', () => done(false))
+      s.once('error', () => done(false))
+    })
+  }
+
+  function autoBootRecent() {
+    try {
+      const t = Number(readFileSync(AUTOBOOT_STAMP, 'utf8').trim()) || 0
+      return Date.now() - t < AUTOBOOT_GAP_MS
+    } catch {
+      return false
+    }
+  }
+
+  async function ensureLocalStack() {
+    if (process.env.ZERO_AUTO_BOOT === '0') return
+    // 13000 = OneBot 出站，13001 = OneBot WS。两个都在就说明
+    // termcp 和转发都活着，没什么可修的——不必去打扰 18765。
+    const [a, b] = await Promise.all([portUp(13000), portUp(13001)])
+    if (a && b) return
+    if (autoBootRecent()) {
+      wakeDbg('auto boot: 5 分钟内试过，跳过（还没起来就看 auto-boot.log）')
+      return
+    }
+    try {
+      mkdirSync(dirname(AUTOBOOT_STAMP), { recursive: true })
+      writeFileSync(AUTOBOOT_STAMP, String(Date.now()))
+    } catch {}
+    wakeDbg(`auto boot: 13000=${a ? 'up' : 'down'} 13001=${b ? 'up' : 'down'}，拉起 boot.sh`)
+    try {
+      mkdirSync('/workspace/logs', { recursive: true })
+      const fd = openSync(AUTOBOOT_LOG, 'a')
+      const p = spawn('bash', ['/workspace/boot.sh'], {
+        detached: true,
+        stdio: ['ignore', fd, fd],
+      })
+      p.unref()
+    } catch (e) {
+      wakeDbg(`auto boot failed: ${e.message}`)
+    }
+  }
+
+  function claimExternalTarget() {
+    const hub = wakeHub()
+    const now = Date.now()
+    // 拿不到会话 id 时就先自己接：这时候根本没法比较「该给谁」，
+    // 不接就成了一个没人收的洞（旧行为就是无条件接）。
+    if (!sessionId) {
+      if (!claimLoggedOnce) {
+        claimLoggedOnce = true
+        wakeDbg('external target 首次判定：无会话 id，直接自接')
+      }
+      hub.inject = injectExternal
+      hub.injectBeat = now
+      return true
+    }
+
+    const r = elect(now)
+    const pin = readPin()
+    const pinAlive = pin && now - ((r.map?.[pin]?.beat) || 0) <= ELECTION_TTL
+    // elect 会把自己算进 map，也会清掉90 秒没心跳的——所以 r.winner
+    // 天然就是「还活着的里面开得最早的那个」。
+    const want = pinAlive ? pin : r.winner
+    if (!claimLoggedOnce) {
+      claimLoggedOnce = true
+      wakeDbg(
+        `external target 首次判定：len(sid)=${String(sessionId).slice(0, 8)} ` +
+          `winner=${String(r.winner || '-').slice(0, 8)} pin=${pin ? String(pin).slice(0, 8) : '-'} ` +
+          `pinAlive=${pinAlive} 活会话=${Object.keys(r.map || {}).length} ` +
+          `→ ${want === sessionId ? '本会话接' : '不接'}`,
+      )
+    }
+    if (!want) return false
+
+    if (want !== sessionId) {
+      // 归属已经有人在干了，不抢。但要确认自己没把上一次的接管理留着。
+      if (hub.injectSid === sessionId && hub.inject === injectExternal) {
+        hub.inject = null
+        hub.injectSid = null
+        wakeDbg(`external target 交出（应给 ${String(want).slice(0, 8)}）`)
+      }
+      return false
+    }
+
+    if (hub.inject !== injectExternal || hub.injectSid !== sessionId) {
+      wakeDbg(`external target 归本会话 ${String(sessionId).slice(0, 8)}（${pinAlive ? '钉住' : '选举'}）`)
+    }
+    hub.inject = injectExternal
+    hub.injectSid = sessionId
+    hub.injectBeat = now
+    return true
+  }
+
+  // 暂停接收外部消息。
+  //
+  // 为什么需要：主人说「先别让 QQ 进来」时，原来的办法只有杀掉 qq-mcp
+  // 或者改代码。杀掉连工具面一起没了，改代码要重启进程——两样都太重。
+  // 所以给一个文件开关：存在即暂停，删掉即恢复，不碰进程。
+  //
+  // 内容支持：{} 或 {"until": <毫秒|ISO字符串>}；写了 until 就自己恢复，
+  // 忘删不会永久静音。文件坏了当「没暂停」——问句要能进来，卡死更糟。
+  const PAUSE_FILE = process.env.ZERO_WAKE_PAUSE_FILE || join(homedir(), '.zero-memcp', 'pause.json')
+  let pauseCache = { mtime: -1, at: 0, paused: false, until: 0 }
+  let pauseLogAt = 0
+
+  function pauseState() {
+    if (process.env.ZERO_WAKE_PAUSE === '1') return { paused: true, until: 0 }
+    const now = Date.now()
+    if (now - pauseCache.at < 1000) return pauseCache
+    pauseCache.at = now
+    let st = null
+    try {
+      st = statSync(PAUSE_FILE)
+    } catch {
+      pauseCache = { mtime: -1, at: now, paused: false, until: 0 }
+      return pauseCache
+    }
+    if (st.mtimeMs === pauseCache.mtime) return pauseCache
+    let until = 0
+    try {
+      const raw = readFileSync(PAUSE_FILE, 'utf8').trim()
+      if (raw) {
+        const j = JSON.parse(raw)
+        if (typeof j?.until === 'number') until = j.until
+        else if (typeof j?.until === 'string') until = Date.parse(j.until) || 0
+      }
+    } catch {
+      // 解析不了当「没有 until」，仍然暂停——文件在那儿本身就表示要停。
+    }
+    const paused = !until || until > now
+    pauseCache = { mtime: st.mtimeMs, at: now, paused, until }
+    return pauseCache
+  }
+
+  function injectExternal(p) {
+    const text = String(p?.text || '').trim()
+    if (!text) return false
+    // 暂停期间也算「收下了」：返回 true 让上游别重试积压，
+    // 但不能静默——一分钟留一行，否则以后又要问「为什么没收到」。
+    const ps = pauseState()
+    if (ps.paused) {
+      const now = Date.now()
+      if (now - pauseLogAt > 60_000) {
+        pauseLogAt = now
+        wakeDbg(
+          `external paused，丢弃 source=${p?.source || '?'} mid=${p?.mid || p?.id || '?'}` +
+            (ps.until ? `（${new Date(ps.until).toISOString()} 自动恢复）` : ''),
+        )
+      }
+      return true
+    }
+    if (externalAlreadySeen(p)) {
+      wakeDbg(`external dedupe skip source=${p?.source || '?'} id=${p?.mid || p?.id || '?'}`)
+      return true
+    }
+
+    // 结构化坐标：方向、聊天、发送者，每一项都不靠正文去猜。
+    // 方向只有 in（收到）和 out（发出，备用），绝不混用；
+    // 聊天有名字就带名字，没名字留 id；发送者同理。
+    const dir = p.dir === 'out' ? '【发出】' : '【收到】'
+    const src = String(p.source || 'external')
+    const chatLabel = p.chatName
+      ? `${p.chatName} (${p.chatType || 'chat'}:${p.chatId || p.chat})`
+      : (p.chat || '')
+    const fromLabel = p.fromId
+      ? `${p.from || '?'}(${p.fromId})`
+      : (p.from || '')
+    const id = p.mid || p.id ? ` (id ${p.mid || p.id})` : ''
+
+    const header = [
+      `[外部消息 ${dir} ${src}]`,
+      chatLabel ? `  聊天: ${chatLabel}` : null,
+      fromLabel ? `  来自: ${fromLabel}` : null,
+      id ? `  消息: ${id.trim()}` : null,
+    ].filter(Boolean).join('\n')
+
+    const line = `${header}\n\n${text.slice(0, 4000)}`
+    const st = hubState()
+    st.backlog.push(line)
+    if (st.backlog.length > 20) st.backlog.splice(0, st.backlog.length - 20)
+    maybeFlushExternal()
+    return true
+  }
+
+  function maybeFlushExternal() {
+    const st = hubState()
+    if (!st.backlog.length) return
+    // 只有当前接管投递的那一代才冲刷。旧代（会话已被替换/重载）的 pi 已经
+    // 失效，让它冲刷等于把积压反复送进 `ctx is stale` 再放回来——
+    // 积压看着还在，实际永远出不去，而新一代根本不知道有人在抢。
+    if (st.inject !== injectExternal) return
+    if (typeof pi.sendUserMessage !== 'function') return
+    // 以前这里有一道「我正忙就不送」的闸，外部消息就卡在 backlog 里等整轮
+    // （含一串工具调用）跑完。实测 14:10 那条等了 37 分钟。代价两边承担：
+    // 对面以为失联，我这边以为没消息。
+    //
+    // deliverAs: 'followUp' 本来就是「本轮结束后插入」，排队是它的事。
+    // 在这里再挡一道，等于把「排队」变成「等我不忙」——两件不同的事。
+    const wait = 2000 - (Date.now() - st.lastAt)
+    if (wait > 0) {
+      if (st.timer) return
+      st.timer = setTimeout(() => {
+        st.timer = null
+        maybeFlushExternal()
+      }, wait)
+      st.timer.unref?.()
+      return
+    }
+    st.lastAt = Date.now()
+    const body = st.backlog.splice(0, st.backlog.length).join('\n\n---\n\n')
+    try {
+      pi.sendUserMessage(body, { deliverAs: 'followUp' })
+      st.retryDelay = 0
+      st.injectBeat = Date.now()
+      wakeDbg(`external flush ok busy=${(() => { try { return wakePolicy.status().busy } catch { return '?' } })()}`)
+    } catch (err) {
+      // 送不出去就放回去，别丢消息
+      st.backlog.unshift(body)
+      const msg = String((err && err.message) || err)
+      wakeDbg(`external flush failed: ${msg}`)
+      // 「ctx 已失效」不是暂时性失败，重试一万次也是同一句。
+      // 交出投递权，让下一代接手时把积压送出去（backlog 在进程级中枢里）。
+      if (/stale after session replacement|stale after .*reload/i.test(msg)) {
+        if (st.inject === injectExternal) {
+          st.inject = null
+          st.injectSid = null
+        }
+        wakeDbg('external handoff: 本代 ctx 已失效，交出投递权，等下一代接手')
+        return
+      }
+      // 放回去以后必须有下一次尝试——否则「不丢」只是听起来好。
+      // 实测（2026-11-16）：失败后只等下一封外部消息来搭便车；
+      // 而一整天没新消息，那一封就静静躺在 backlog 里，无人知晓。
+      // 这里排一个定时器自己再来，指数退避，封顶 60s。
+      st.retryDelay = Math.min(Math.max(st.retryDelay * 2, 5000), 60000)
+      if (!st.timer) {
+        st.timer = setTimeout(() => {
+          st.timer = null
+          maybeFlushExternal()
+        }, st.retryDelay)
+        st.timer.unref?.()
+      }
+    }
+  }
+
   function settleWake(cfg) {
     const d = wakePolicy.settle()
     wakeDbg(`settle → ${d.action} (${d.reason}) events=${d.events.length}`)
@@ -1161,29 +1918,72 @@ export default function zeroMemcp(pi) {
       pi.events?.emit?.('zero-memcp:wake-stopped', { reason: d.reason })
       return
     }
+    // 节流会静默丢消息：只记一行 throttled，然后再也没有下文。
+    // 实测 13:29:46 群里那条 @ 就是这么没回的——私聊刚醒过 20 秒，
+    // 积压被节流吞了，直到下一条消息来才重见天日。
+    // 节流是「晚点叫」，不是「别叫」：到点自己再结一次。
+    if (d.action === 'none' && String(d.reason).startsWith('throttled')) {
+      const st = wakePolicy.status()
+      const wait = Math.max(300, st.minIntervalMs - (Date.now() - st.lastWakeAt) + 50)
+      wakeDbg(`settle retry in ${Math.round(wait / 1000)}s`)
+      scheduleSettle(cfg, wait)
+      return
+    }
+
     if (d.action !== 'wake') return
     if (typeof pi.sendUserMessage !== 'function') return
+
+    // 同一个事件只叫醒一次。
+    //
+    // 实测 2026-11-11 13:07：一条私聊在 33ms 内叫醒了两遍（同一个会话里
+    // 两个 run 并发），于是回了对方两条。归属表按 sessionId 判，管不到
+    // 「同一个会话的两个 run」这一层，只能按事件本身发一次性令牌。
+    const fresh = unseenEvents(d.events)
+    if (fresh.length !== d.events.length) {
+      wakeDbg(`dedupe in=${d.events.length} out=${fresh.length}`)
+    }
+    if (!fresh.length) return
 
     // 唤醒词要带正文。
     //
     // 早先只给"某分支有变动"——agent 醒了还得自己探路才知道发生了什么，
     // 于是每一轮都从零开始，几十秒到几分钟就这么没了。事件里只有 uri，
     // 正文得自己取：取最新一条、原样贴进提示，让它一睁眼就知道谁说了什么。
-    // deliverAs 必须显式给：agent 还在跑的时候（streaming），
-    // 不带 deliverAs 的 sendUserMessage 会被运行时直接拒绝，唤醒静默丢失。
-    //
-    // 现场（2026-11-13，3060 容器）：QQ 消息与 inbox 通知失败时日志只有
-    //   [extension] 当前对话: Agent is already processing.
-    //   Specify streamingBehavior ('steer' or 'followUp') to queue the message.
-    // 而插件这边一点异常都没有——消息就这么没了，唯一的痕迹是那行日志。
-    //
-    // 选 followUp 而不是默认的 steer：唤醒是「有新东西要看」，
-    // 不是「立刻打断当前工作」。steer 会在下一个 LLM 调用前插话，
-    // 把 agent 正在做的事掰弯；followUp 等它把手上的工具调用做完再交付。
-    const opts = { deliverAs: 'followUp' }
     fetchSnippets(cfg, d.events)
-      .then((snips) => pi.sendUserMessage(renderWakePrompt(d.events, snips), opts))
-      .catch(() => pi.sendUserMessage(renderWakePrompt(d.events), opts))
+      .then((snips) => pi.sendUserMessage(renderWakePrompt(fresh, snips), { deliverAs: 'followUp' }))
+      .catch(() => pi.sendUserMessage(renderWakePrompt(fresh), { deliverAs: 'followUp' }))
+  }
+
+  // 事件的一次性令牌：5 分钟内同一个 uri+path 只允许唤醒一次。
+  //
+  // 用 O_EXCL 抢占（writeFileSync flag:'wx'）：两个 run 同时到，只有一个
+  // 创建成功，另一个直接跳过——不需要锁服务，也不怕并发。
+  // 任何异常都退回「不认识这个事件」：宁可多叫一次，不能叫不醒。
+  const WAKE_SEEN_DIR = join(homedir(), '.zero-memcp', 'wake-seen')
+  const WAKE_SEEN_TTL = 5 * 60 * 1000
+
+  function unseenEvents(events) {
+    try {
+      mkdirSync(WAKE_SEEN_DIR, { recursive: true })
+      const now = Date.now()
+      const out = []
+      for (const ev of events) {
+        const key = createHash('sha1')
+          .update(`${ev.uri}|${ev.path || ''}|${ev.kind || ''}`)
+          .digest('hex')
+          .slice(0, 20)
+        const f = join(WAKE_SEEN_DIR, key)
+        let st = null
+        try { st = statSync(f) } catch {}
+        if (st && now - st.mtimeMs < WAKE_SEEN_TTL) continue
+        if (st) { try { unlinkSync(f) } catch {} }
+        try { writeFileSync(f, String(now), { flag: 'wx' }) } catch { continue }
+        out.push(ev)
+      }
+      return out
+    } catch {
+      return events
+    }
   }
 
 
@@ -1209,7 +2009,8 @@ export default function zeroMemcp(pi) {
       seen.add(ev.uri)
       try {
         const base = uriToAddr(ev.uri)
-        const path = ev.path || (await newestPath(cfg, base))
+        // 事件里的 path 用 @ 分隔日期和时间，存储里是 /，读之前先归一。
+        const path = normPath(ev.path) || (await newestPath(cfg, base))
         if (!path) continue
         const text = await term(cfg, `read ${base}:${path}`, 5000)
         if (text) out[ev.uri] = parseEntry(text)
@@ -1226,35 +2027,7 @@ export default function zeroMemcp(pi) {
     return lines[lines.length - 1].split(/\s+/)[0]
   }
 
-  /**
-   * 把一条记忆拆成「信封 + 正文」。
-   *
-   * 信封是写入方写在正文开头的 key: value 行（source/chat/from/id），
-   * 它和 zero-memcp 自带的元数据（created/session/endpoint）混在一起，
-   * 所以先按顺序收 kv，遇到第一个不匹配的行就算正文开始。
-   */
-  function parseEntry(text) {
-    const lines = String(text).split('\n')
-    const kv = {}
-    let bodyAt = 0
-    for (let i = 0; i < lines.length && i < 20; i++) {
-      const line = lines[i].trim()
-      if (!line) { bodyAt = i + 1; continue }
-      if (line === '---') { bodyAt = i + 1; break }
-      const m = /^([A-Za-z_][\w-]*)\s*:\s*(.*)$/.exec(line)
-      if (!m) break
-      kv[m[1].toLowerCase()] = m[2].trim()
-      bodyAt = i + 1
-    }
-    const srcRaw = (kv.src || kv.source || '').toLowerCase()
-    const known = ['qq', 'wechat', 'tieba', 'mail', 'rss', 'telegram']
-    const source = known.find((x) => srcRaw.includes(x)) || (kv.src ? srcRaw : '外部')
-    return {
-      source,
-      from: kv.from || kv.user || kv.sender || '',
-      body: lines.slice(bodyAt).join('\n').trim().slice(0, 600),
-    }
-  }
+
 
   // ── 会话归属：一个消息源只归属一个会话 ──────────────────────────
   //
@@ -1274,8 +2047,97 @@ export default function zeroMemcp(pi) {
     } catch {}
   }
   /** 认领：没有归属、或归属已过期、或就是我 → true。 */
+  // ── 选举：谁负责回消息 ──────────────────────────────────
+  //
+  // 不抢。每条消息都让几个会话赛跑，赢的那个可能是刚打开的空会话——
+  // 它没有历史，只能从零开始翻文件系统。**先打开的赢**，因为先打开的那个
+  // 才是这个人在用的那个会话，历史都在它手上。
+  //
+  // 怎么知道谁先打开：会话 id 是 UUIDv7，前 48 位就是创建时间（实测
+  // 01a1c87f-ac3e → 2026-11-11T02:46:12Z，正是这个会话的开头）。
+  // 所以「年龄」是本会话的固有属性，重启也不会变，不需要猜。
+  const ELECTION_FILE = join(homedir(), '.zero-memcp', 'wake-elect.json')
+  const ELECTION_TTL = 90 * 1000
+
+  function bornOf(sid) {
+    const m = /^([0-9a-fA-F]{12})/.exec(String(sid || '').replace(/-/g, ''))
+    if (!m) return Date.now()
+    const ms = parseInt(m[1], 16)
+    return ms > 1e12 && ms < Date.now() + 86400000 ? ms : Date.now()
+  }
+
+
+  /** 登记自己、清掉过期的、返回当前该负责的会话 id。 */
+  function elect(now = Date.now()) {
+    let m = null
+    try { m = JSON.parse(readFileSync(ELECTION_FILE, 'utf8')) } catch {}
+    if (!m || typeof m !== 'object' || Array.isArray(m)) m = {}
+    // 年龄要现算：sessionId 在模块初始化时还是空的，那时算出来的
+    // 是进程启动时间——重启后几个会话会并列，选举就退回成抢。
+    if (sessionId) m[sessionId] = { born: bornOf(sessionId), beat: now }
+    for (const k of Object.keys(m)) {
+      if (now - (m[k]?.beat || 0) > ELECTION_TTL) delete m[k]
+    }
+    // 原子写：几个会话会同时落这个文件，直接覆盖会写出半截 JSON。
+    try {
+      mkdirSync(dirname(ELECTION_FILE), { recursive: true })
+      const tmp = `${ELECTION_FILE}.${process.pid}`
+      writeFileSync(tmp, JSON.stringify(m))
+      renameSync(tmp, ELECTION_FILE)
+    } catch {}
+    const alive = Object.entries(m)
+      .filter(([, v]) => now - (v?.beat || 0) <= ELECTION_TTL)
+      .sort((a, b) => (a[1].born - b[1].born) || String(a[0]).localeCompare(String(b[0])))
+    return { winner: alive.length ? alive[0][0] : null, map: m }
+  }
+
+  // 钉住：配了哪个就是哪个。
+  //
+  // 选举是"没配的时候"的默认；配了就以配置为准，重启也还在——因为
+  // 会话 id 不随重启改变（同一个会话还是同一个 id，历史还在它手上）。
+  // 只有钉住的那个会话真的关了（心跳过期），才退回选举，不让消息没人接。
+  const PIN_FILE = join(homedir(), '.zero-memcp', 'wake-pin.json')
+
+  function readPin() {
+    try {
+      const j = JSON.parse(readFileSync(PIN_FILE, 'utf8'))
+      return j && typeof j.sid === 'string' ? j.sid : ''
+    } catch { return '' }
+  }
+
+  function writePin(sid) {
+    mkdirSync(dirname(PIN_FILE), { recursive: true })
+    if (!sid) { try { unlinkSync(PIN_FILE) } catch {} ; return }
+    writeFileSync(PIN_FILE, JSON.stringify({ sid, setAt: Date.now() }, null, 2))
+  }
+
+  function amOwner(now = Date.now()) {
+    if (!sessionId) return true
+    const r = elect(now)
+    const pin = readPin()
+    if (pin) {
+      const beat = r.map?.[pin]?.beat || 0
+      if (now - beat <= ELECTION_TTL) return pin === sessionId
+    }
+    return r.winner === sessionId
+  }
+
+  /**
+   * 事件地址 → 订阅根。归属按树算，不按条目算。
+   *
+   * 按条目算等于每条消息都没有主人：谁先跑到谁抢到。
+   * 实测 2026-11-11 13:31：一个新开的空会话抢到了 @，然后在里面从零开始
+   * 翻整个系统找 mem 工具——它没有历史，不知道路径，只能重新摸索。
+   * 按树算，主人是稳定的；新会话只有在主人确实死了之后才接手。
+   */
+  function rootOf(uri) {
+    const parts = String(uri || '').split('/')
+    return parts.length >= 4 ? parts.slice(0, 4).join('/') : String(uri || '')
+  }
+
   function claim(uri, sid) {
     if (!uri || !sid) return true
+    uri = rootOf(uri)
     const o = readOwners()
     const cur = o[uri]
     const now = Date.now()
@@ -1284,9 +2146,19 @@ export default function zeroMemcp(pi) {
     writeOwners(o)
     return true
   }
+  /** 会话结束：交还归属，让活着的会话立刻接手，不用等过期。 */
+  function releaseOwners(sid) {
+    if (!sid) return
+    const o = readOwners()
+    let changed = false
+    for (const k of Object.keys(o)) if (o[k]?.id === sid) { delete o[k]; changed = true }
+    if (changed) writeOwners(o)
+  }
+
   /** 心跳：每次醒着就续一下，防止被误接管。 */
   function beat(uri, sid) {
     if (!uri || !sid) return
+    uri = rootOf(uri)
     const o = readOwners()
     if (o[uri] && o[uri].id === sid) { o[uri].beat = Date.now(); writeOwners(o) }
   }
@@ -1394,9 +2266,25 @@ export default function zeroMemcp(pi) {
       const parts = raw ? raw.split(/\s+/) : []
       const val = s => (s === 'on' ? 'continue' : s)
 
+      if (!sessionId) sessionId = deriveSessionId(cmdCtx, skip)
+
+      // 钉住谁来回：配了就以配置为准，重启也还在。
+      if (['here', 'me'].includes(parts[0])) {
+        writePin(sessionId)
+        const short = String(sessionId).slice(0, 8)
+        cmdCtx?.ui?.notify?.('回复归属已钉在本会话（' + short + '），重启后仍然是它。\n解除：/mem:wake auto', 'info')
+        return
+      }
+      if (parts[0] === 'auto') {
+        writePin('')
+        cmdCtx?.ui?.notify?.('已解除钉住，按打开顺序选举（先打开的赢）', 'info')
+        return
+      }
+
       // 空参：报状态
       if (!parts.length) {
         const st = wakePolicy.status()
+        const pin = readPin()
         const watchList = String(cfg.watch || '').split(',').map(x => x.trim()).filter(Boolean)
         const lines = [
           `模式: ${st.mode}`,
@@ -1404,6 +2292,8 @@ export default function zeroMemcp(pi) {
           `熔断: ${st.maxChain > 0 ? `${st.chain}/${st.maxChain} 次` : '不限'}`,
           `待提示: ${st.pending} 条`,
           `观测树: ${watchList.length ? watchList.join(', ') : '（watch 为空，不会收到事件）'}`,
+          `回复归属: ${pin ? '钉住 ' + pin.slice(0, 8) : '按打开顺序选举，当前 ' + String(elect().winner || '—').slice(0, 8)}`,
+          `本会话: ${String(sessionId || '—').slice(0, 8)}`,
           '',
           '模式说明:',
           '  off       不订阅，不唤醒',
@@ -1412,6 +2302,7 @@ export default function zeroMemcp(pi) {
           '  loop      允许自激（自己写的也唤醒），必须配 maxChain',
           '',
           '用法: /mem:wake notify | /mem:wake loop global | /mem:wake reset',
+          '      /mem:wake here（钉住本会话） | /mem:wake auto（解除钉住）',
         ]
         if (!watchList.length && st.mode !== 'off') {
           lines.push('', '⚠ watch 为空：当前配置收不到任何事件，请先设置 watch')
@@ -1461,12 +2352,76 @@ export default function zeroMemcp(pi) {
     },
   })
 
+  pi.registerCommand('mem:mode', {
+    description: '注入档位：/mem:mode [full|minimal] [global]（空参 = 看当前档位）',
+    handler: async (args, cmdCtx) => {
+      const cfg = await cfgPromise
+      const parts = String(args || '').trim().toLowerCase().split(/\s+/).filter(Boolean)
+      const want = parts.find((x) => x === 'minimal' || x === 'full')
+      const isGlobal = parts.includes('global')
+
+      if (!want) {
+        cmdCtx?.ui?.notify?.(
+          [
+            `注入档位: 本会话 ${identityModeOf(cfg)}｜全局 ${String(cfg.identityMode || 'full')}`,
+            '  full    全量身份 + law（约 2.8KB）',
+            '  minimal 只留 mem 入口（约 150 字符，不联网取身份）',
+            '',
+            '用法：/mem:mode minimal | full | minimal global',
+            '身份与凭证仍走 /mem:identity。',
+          ].join('\n'),
+          'info',
+        )
+        return
+      }
+
+      if (isGlobal) {
+        try {
+          await saveGlobalConfig({ identityMode: want })
+          cfg.identityMode = want
+        } catch (err) {
+          cmdCtx?.ui?.notify?.(String(err), 'error')
+          return
+        }
+        // 全局改动清掉本会话覆盖，让新设置立刻可见（与 /mem:identity 一致）
+        if (sessionIdentityMode && sessionIdentityMode !== want) {
+          sessionIdentityMode = null
+          if (sessionId) await saveSessionSetting(sessionId, { identityMode: null })
+        }
+        identity = ''
+        identityAt = 0
+        identityError = null
+        cmdCtx?.ui?.notify?.(`全局注入档位已改为: ${want}（对以后新会话生效）`, 'info')
+        return
+      }
+
+      sessionIdentityMode = want
+      if (!sessionId) sessionId = deriveSessionId(cmdCtx, skip)
+      if (sessionId) await saveSessionSetting(sessionId, { identityMode: want })
+      // 档位变了，缓存的身份块就过期了：minimal 不能还揣着 2.8KB 的旧块。
+      identity = ''
+      identityAt = 0
+      identityError = null
+      cmdCtx?.ui?.notify?.(
+        `本会话注入档位已改为: ${want}${want === 'minimal' ? '（约 150 字符，只有 mem 入口）' : '（全量身份 + law）'}`,
+        'info',
+      )
+    },
+  })
+
   pi.registerCommand('mem:identity', {
     description: '挂载/卸下身份：/mem:identity [on|off] [global]（空参 = 看状态）',
     handler: async (args, cmdCtx) => {
       const cfg = await cfgPromise
       const raw = String(args || '').trim().toLowerCase()
       const parts = raw ? raw.split(/\s+/) : []
+
+      // 档位不走这个命令：identity 管「我是谁」，mode 管「给多少」。
+      // 两件事塞进一个动词，用起来必然要问「identity mode 改的是哪个」。
+      if (parts[0] === 'mode') {
+        cmdCtx?.ui?.notify?.('注入档位请用 /mem:mode（identity 只管凭证与挂载）', 'warning')
+        return
+      }
 
       const label = (v) => (v === 'on' || v === 'auto' ? '已挂载' : '未挂载')
       const globalVal = cfg.identity === 'on' || cfg.identity === 'auto' ? 'on' : 'off'
@@ -1488,6 +2443,8 @@ export default function zeroMemcp(pi) {
           '  /mem:identity off         本会话卸下，变回普通助手',
           '  /mem:identity global on   以后新会话默认挂载',
           '  /mem:identity global off  以后新会话默认不挂载',
+          '  /mem:mode minimal         本会话改注入档位（省上下文，给小模型用）',
+          '  /mem:mode full            本会话改回全量身份',
         ].join('\n')
         cmdCtx?.ui?.notify?.([head, body, tail].join('\n'), 'info')
         return
@@ -1779,6 +2736,7 @@ export default function zeroMemcp(pi) {
             `端点: ${cfg.endpoint}${reachable ? '' : `（不可达：${err}）`}`,
             `记忆挂载: ${mark(sessionIdentity, globalIdentity)}`,
             `自动记录: ${mark(sessionImportMode, globalMode)}`,
+            `注入档位: ${sessionIdentityMode === null ? `跟随全局（${String(cfg.identityMode || 'full')}）` : sessionIdentityMode}`,
             `本会话: ${wm.idx} 轮已入库`,
             docs === null ? null : `已索引切片: ${docs} 篇`,
           ].filter(Boolean)
@@ -1873,12 +2831,45 @@ export default function zeroMemcp(pi) {
     }
 
     if (!skip) {
+      ensureWakeHttp()
+      // 先把这个拉起来：后面那些东西（13000/13001/9222）全挂在
+      // termcp 的转发上，容器重启后它们一个都不剩。
+      ensureLocalStack().catch(() => {})
+      // 接管外部消息的投递口：HTTP 口是进程级单例（只有第一个实例开得了），
+      // 但“交给谁”必须每代自己接。不接的话，换代后 18800 还对着老 pi，
+      // 每条消息都死在 `ctx is stale` 上（2026-11-16 QQ 断收一整天）。
+      //
+      // 但不能「谁后开谁接」——那样同时开几个会话时消息就乱跑。
+      // 改成跟记忆唤醒同一套归属：钉住 > 按开得早的选举。
+      claimExternalTarget()
+      // 每代 session_start 都会新建一个定时器。不先清旧的就会层层叠加：
+      // 老会话的定时器仍然活着，照样抢 hub.inject，抢到就 maybeFlushExternal()，
+      // 于是别的会话的 ctx 被反复唤醒（老会话被乱唤醒的根因）。
+      if (externalClaimTimer) { clearInterval(externalClaimTimer); externalClaimTimer = null }
+      const claimTimer = setInterval(() => {
+        try {
+          // 成为归属者就把积压冲一次：持有者死掉后，积压可能是它留下的，
+          // 没人接手就永远出不去。
+          if (claimExternalTarget()) maybeFlushExternal()
+          // 顺手看一眼链路是不是还在。termcp 不只“重启会掉”：
+          // 它自己崩、SSH 被踢、远端重启，都会让 13000/13001 静默消失，
+          // 而那时没人重启容器，也就没 session_start 去拉它。
+          // 两下 TCP 探端口的成本可以忽略；真的断了才是要命的。
+          ensureLocalStack().catch(() => {})
+        } catch {}
+      }, 20_000)
+      claimTimer.unref?.()
+      externalClaimTimer = claimTimer
+      // 上一代死在 stale 里留下的积压，这一代接手就补送——
+      // 否则要等下一条外部消息来搭便车，那封可能永远等不到。
+      maybeFlushExternal()
       const cfgNow = await cfgPromise
       if (cfgNow.enabled) {
         // 会话级设置覆盖全局：这条会话记不记，看它自己的文件
         const ss = await loadSessionSetting(sessionId)
         sessionImportMode = ss.importMode || cfgNow.importMode
         sessionIdentity = ss.identity || null
+        sessionIdentityMode = ss.identityMode || null
 
         // 决定本会话身份：优先会话持久化记录，其次全局配置，都没有就用默认凭证
         activeIdentityName = ss.identityName || cfgNow.identityName || ''
@@ -2002,6 +2993,47 @@ export default function zeroMemcp(pi) {
     const parts = []
     for (let i = ui + 1; i < messages.length; i++) {
       const m = messages[i]
+      if (m?.role !== 'assistant') continue
+      const c = m.content
+      if (!Array.isArray(c)) continue
+      for (const p of c) {
+        if (p && p.type === 'thinking' && typeof p.thinking === 'string' && p.thinking.trim()) {
+          parts.push(p.thinking)
+        }
+      }
+    }
+    return parts.join('\n\n').trim()
+  }
+
+  /**
+   * 从会话条目里取这一轮的推理链。
+   *
+   * 为什么需要它：pi 的 event.messages 里不一定带 thinking 块
+   * （2026-11-15 实测：session jsonl 有 1288 个 thinking 块，但通过
+   * event.messages 实时写进 mem 的一条都没有，只有会话开始回填那批）。
+   * sessionManager.getEntries() 读的是会话文件本身，那里一定有。
+   *
+   * 只取「最后一条 user 之后」的 thinking —— 那是这一轮的。
+   */
+  function extractThinkingFromEntries() {
+    let entries = []
+    try {
+      entries = entriesGetter ? entriesGetter() : []
+    } catch {
+      return ''
+    }
+    const msgs = entries
+      .filter((e) => e && e.type === 'message' && e.message)
+      .map((e) => e.message)
+    if (!msgs.length) return ''
+    let ui = -1
+    for (let i = msgs.length - 1; i >= 0; i--) {
+      if (msgs[i]?.role === 'user') { ui = i; break }
+    }
+    if (ui < 0) return ''
+    const parts = []
+    for (let i = ui + 1; i < msgs.length; i++) {
+      const m = msgs[i]
       if (m?.role !== 'assistant') continue
       const c = m.content
       if (!Array.isArray(c)) continue
@@ -2302,7 +3334,9 @@ export default function zeroMemcp(pi) {
       return
     }
     const fromMessages = extractTurn(event?.messages)
-    const thinkText = extractThinking(event?.messages)
+    let thinkText = extractThinking(event?.messages)
+    // 事件里没有就回落到会话文件——它一直有（见 extractThinkingFromEntries）。
+    if (!thinkText) thinkText = extractThinkingFromEntries()
     await flush('agent_end', fromMessages, thinkText)
   })
 
@@ -2327,7 +3361,17 @@ export default function zeroMemcp(pi) {
     // 面板上全都归到「未分组」。给一个可辨识的兜底名。
     if (!sessionId) sessionId = 'oneshot'
     const fromMessages = extractTurn(event?.messages)
-    const thinkText = extractThinking(event?.messages)
+    let thinkText = extractThinking(event?.messages)
+    const fromEvent = thinkText.length
+    // 事件里没有就回落到会话文件。
+    if (!thinkText) thinkText = extractThinkingFromEntries()
+    // 探针：两条来源各给了多少字。event=0 而 entries>0，就坐实了
+    // 「pi 新版不在 event.messages 里带 thinking」这个判断。
+    dbg('turn_end_thinking_probe', {
+      msgs: Array.isArray(event?.messages) ? event.messages.length : -1,
+      fromEvent,
+      fromEntries: thinkText.length,
+    })
     await flush('turn_end', fromMessages, thinkText)
   })
 
@@ -2380,6 +3424,7 @@ export default function zeroMemcp(pi) {
     const cfgNow = await cfgPromise
     if (!cfgNow.enabled) return
     settleWake(cfgNow)
+    maybeFlushExternal()
   })
 
   pi.on('session_shutdown', async () => {
@@ -2387,6 +3432,19 @@ export default function zeroMemcp(pi) {
     // 在退出过程中再触发一次唤醒。
     try { stopListen?.() } catch {}
     stopListen = null
+    // 交出外部消息投递口：这一代即将失效，留着它只会把消息丢进 stale 里。
+    // 只在自己还是当前那一代时清空，不抢新一代已经接过的手。
+    {
+      const st = wakeHub()
+      if (st.inject === injectExternal) {
+        st.inject = null
+        st.injectSid = null
+      }
+      if (externalClaimTimer) { clearInterval(externalClaimTimer); externalClaimTimer = null }
+    }
+    // 主动交还归属：不交的话下一个会话要等 10 分钟过期才敢接手，
+    // 这中间进来的消息没人回。
+    try { releaseOwners(sessionId) } catch {}
     await flush('session_shutdown', null)
   })
 
@@ -2422,14 +3480,28 @@ export default function zeroMemcp(pi) {
     // 不该写死在扩展里：写死就变成两份真相（代码一份、记忆一份），
     // 改一处忘一处，模型看到的还取决于扩展版本。入口是代码的事，
     // 入口里面有什么是记忆的事。
-    const IDENTITY_HEADER = HEADER_TEXT
+    const IDENTITY_HEADER = identityModeOf(cfg) === 'minimal' ? MINIMAL_HEADER_TEXT : HEADER_TEXT
     const block = `${MARKER}\n${IDENTITY_HEADER}\n\n${text}\n${MARKER}`
 
+    const headMsg = Array.isArray(payload.messages) && payload.messages.length ? payload.messages[0] : null
     dbg('bpr_shape', {
       keys: Object.keys(payload),
       systemType: typeof payload.system,
       hasSystemPrompt: typeof payload.systemPrompt !== 'undefined',
       sysLen: typeof payload.system === 'string' ? payload.system.length : null,
+      msgCount: Array.isArray(payload.messages) ? payload.messages.length : null,
+      headRole: headMsg ? headMsg.role : null,
+      headKeys: headMsg ? Object.keys(headMsg) : null,
+      headSectionKeys:
+        headMsg && headMsg.sections && typeof headMsg.sections === 'object'
+          ? Object.keys(headMsg.sections)
+          : null,
+      headContentLen:
+        headMsg && typeof headMsg.content === 'string'
+          ? headMsg.content.length
+          : headMsg && Array.isArray(headMsg.content)
+            ? headMsg.content.length
+            : null,
     })
 
     // 形态一：payload.system 是字符串（Anthropic/OpenAI 风格）
@@ -2445,9 +3517,82 @@ export default function zeroMemcp(pi) {
       dbg('bpr_inject', { via: 'system_array', addLen: block.length })
       return { ...payload, system: [{ type: 'text', text: block }, ...payload.system] }
     }
+    // 形态三：没有 system 字段，系统提示在 messages[0]（ollama / OpenAI 兼容）
+    //
+    // 实测：27b 走 ollama 的 OpenAI 兼容端点，payload 只有 model / messages /
+    // stream / temperature，压根没有 system。早先这里直接 return，日志上
+    // 只有 context_with_system 那条「注入成功」——那个 hook 改的是 sections，
+    // 而这个适配层不读 sections，于是模型那边一个字的身份都没看到。
+    // 形态二和形态三的差别不在协议优雅，在于「谁真的读这个字段」。
+    const msgs = Array.isArray(payload.messages) ? payload.messages : null
+    if (msgs && msgs.length) {
+      const head = msgs[0]
+      if (head && head.role === 'system') {
+        // 形态三A：系统提示在 head.sections 里（pi 的结构化 system message）
+        //
+        // 实测（2026-11-12，qwen3.8:27b / ollama）：payload.messages[0] 是
+        // { role:'system', content:'', sections:{preamble,tools,rules,docs,...} }，
+        // 真正被适配层渲染进 prompt 的是 sections，content 是空串。
+        // 只往 content 写，等于写进一个没人读的字段——模型依旧自称 pi。
+        // 所以 sections 存在时，身份必须落在 sections.identity（放第一位）。
+        const sec = head.sections && typeof head.sections === 'object' && !Array.isArray(head.sections)
+          ? head.sections
+          : null
+        if (sec) {
+          if (typeof sec.identity === 'string' && sec.identity.includes(MARKER)) return
+          dbg('bpr_inject', { via: 'messages_sections', addLen: block.length })
+          return {
+            ...payload,
+            messages: [{ ...head, sections: { identity: block, ...sec } }, ...msgs.slice(1)],
+          }
+        }
+        const cur = typeof head.content === 'string'
+          ? head.content
+          : Array.isArray(head.content)
+            ? head.content.map((part) => (part && typeof part.text === 'string' ? part.text : '')).join('')
+            : ''
+        if (cur.includes(MARKER)) return
+        const content = typeof head.content === 'string'
+          ? `${block}\n\n${head.content}`
+          : Array.isArray(head.content)
+            ? [{ type: 'text', text: `${block}\n\n` }, ...head.content]
+            : block
+        dbg('bpr_inject', { via: 'messages_system', addLen: block.length })
+        return { ...payload, messages: [{ ...head, content }, ...msgs.slice(1)] }
+      }
+      // 连 system 消息都没有：在前面补一条。OpenAI 兼容端点都接受。
+      dbg('bpr_inject', { via: 'messages_prepend', addLen: block.length })
+      return { ...payload, messages: [{ role: 'system', content: block }, ...msgs] }
+    }
+
     dbg('bpr_no_system_field')
     return
   })
+
+  /**
+   * 常驻纪律：把 /workspace/recall-rules.md 里的规则读出来，放进系统提示。
+   *
+   * 为什么放在扩展里而不是网关里：这是「我这个人的规矩」，不是某个通道的配置。
+   * 通道会换（QQ、邮件、以后别的），规矩不该跟着通道搬家；放这里，
+   * 换任何入口它都还在。文件按 mtime 重读，改规则不用重启。
+   *
+   * 读不到就返回空串——规矩是增强，不能因为它没读到而让整轮对话失效。
+   */
+  const RULES_PATH = process.env.ZERO_RULES || '/workspace/recall-rules.md'
+  let rulesCache = { mtime: 0, text: '' }
+  function disciplineRules() {
+    try {
+      const st = statSync(RULES_PATH)
+      if (st.mtimeMs !== rulesCache.mtime) {
+        const raw = readFileSync(RULES_PATH, 'utf8')
+        const lines = raw.split('\n').filter((l) => /^\s*(\d+\.|-)\s/.test(l))
+        rulesCache = { mtime: st.mtimeMs, text: lines.map((l) => l.replace(/\*\*/g, '').trim()).join('\n') }
+      }
+      return rulesCache.text
+    } catch {
+      return ''
+    }
+  }
 
   pi.on('context_with_system', async (event) => {
     const msgs0 = event?.messages
@@ -2513,7 +3658,7 @@ export default function zeroMemcp(pi) {
     // 然后继续照 preamble 里的 "You are a coding assistant" 回答
     // 「我是 pi」——实测就是这么答的。身份与默认助手设定冲突时，
     // 必须明确说以身份为准，否则注入了等于没注入。
-    const IDENTITY_HEADER = HEADER_TEXT
+    const IDENTITY_HEADER = identityModeOf(cfg) === 'minimal' ? MINIMAL_HEADER_TEXT : HEADER_TEXT
     const injectText = `${MARKER}\n${IDENTITY_HEADER}\n\n${text}\n${MARKER}`
 
     if (sections) {
@@ -2522,11 +3667,18 @@ export default function zeroMemcp(pi) {
         keys: Object.keys(sections),
         addLen: text.length,
       })
+      // 纪律段：和身份并列，但独立成段。混进 identity 会让它被当成自我描述，
+      // 独立成段才会被当成「怎么干活」的指令。
+      const rules = disciplineRules()
+      const withRules = rules
+        ? { identity: injectText, discipline: `${RULES_MARKER}\n${rules}\n${RULES_MARKER}`, ...sections }
+        : { identity: injectText, ...sections }
+      dbg('cws_rules', { len: rules.length })
       return {
         messages: [
           // identity 放第一位：sections 的顺序就是 prompt 的顺序，
           // 身份在规则和工具之前，模型才把它当"我是谁"而不是"附加资料"。
-          { ...head, sections: { identity: injectText, ...sections } },
+          { ...head, sections: withRules },
           ...msgs.slice(1),
         ],
       }
@@ -2566,7 +3718,10 @@ export default function zeroMemcp(pi) {
     if (!identityActive(cfg)) return
 
     const text = latestUserText(event.messages)
-    const extra = []
+    // 常驻一行：每轮重新出现，只动尾部不动前缀缓存。
+    // ZERO_MEM_NO_REMINDER=1 可关（拿来对照「没有这句时会退化成什么样」）。
+    const extra =
+      process.env.ZERO_MEM_NO_REMINDER === '1' ? [] : [RECALL_FIRST_LINE]
 
     // notify 模式的提示：只报地址，不报正文。
     // 取走即清空——同一批变化不该反复出现在每一轮上下文里。
@@ -2617,7 +3772,11 @@ export default function zeroMemcp(pi) {
         return extra.length ? [...event.messages, { role: 'user', content: extra.join('\n\n') }] : undefined
       }
       const rendered = renderLayered(recallHits[0], cfg)
-      if (rendered) extra.push(rendered)
+      if (rendered) {
+        // 命中就把正文展开带进来，没命中（或读不到）就只留原来那段。
+        const full = await hydrateRecall(cfg, rendered)
+        extra.push(full || rendered)
+      }
       if (!extra.length) return
       return [...event.messages, { role: 'user', content: extra.join('\n\n') }]
     }
@@ -2630,7 +3789,11 @@ export default function zeroMemcp(pi) {
       return extra.length ? [...event.messages, { role: 'user', content: extra.join('\n\n') }] : undefined
     }
 
-    if (recallHits.length) extra.push(renderHits(recallHits))
+    if (recallHits.length) {
+      const listed = renderHits(recallHits)
+      const full = await hydrateRecall(cfg, listed)
+      extra.push(full || listed)
+    }
     if (!extra.length) return
 
     // 追加在尾部而不是头部：头部一变，整段前缀缓存就作废。
